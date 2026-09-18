@@ -1,0 +1,54 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "title": { "title": "عنوان العقار", "type": "string" },
+        "price_sar": { "title": "السعر (ريال)", "type": "string" },
+        "property_type": { "title": "نوع العقار", "type": "string" },
+        "listing_type": { "title": "بيع / إيجار", "type": "string" },
+        "city": { "title": "المدينة", "type": "string" },
+        "district": { "title": "الحي", "type": "string" },
+        "address": { "title": "العنوان الكامل", "type": "string" },
+        "area_sqm": { "title": "المساحة (م²)", "type": "string" },
+        "bedrooms": { "title": "غرف النوم", "type": "string" },
+        "bathrooms": { "title": "دورات المياه", "type": "string" },
+        "phone": { "title": "رقم الجوال", "type": "string" },
+        "owner_name": { "title": "اسم المعلن", "type": "string" },
+        "owner_type": { "title": "نوع المعلن", "type": "string" },
+        "rega_license": { "title": "رقم ترخيص هيئة العقار", "type": "string" },
+        "is_verified": { "title": "موثّق", "type": "boolean" },
+        "posted_at": { "title": "تاريخ النشر", "type": "string" },
+        "posted_at_iso": { "title": "تاريخ النشر (ISO)", "type": "string" },
+        "updated_at": { "title": "تاريخ التحديث", "type": "string" },
+        "has_image": { "title": "يحتوي صور", "type": "boolean" },
+        "images": { "title": "روابط الصور", "type": "array" },
+        "url": { "title": "رابط الإعلان", "type": "string" }
+    },
+    "views": {
+        "overview": {
+            "title": "نظرة عامة",
+            "transformation": {
+                "fields": [
+                    "title", "price_sar", "property_type", "city",
+                    "district", "area_sqm", "bedrooms", "phone",
+                    "is_verified", "posted_at", "url"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "title": { "label": "عنوان العقار", "format": "text" },
+                    "price_sar": { "label": "السعر (ريال)", "format": "text" },
+                    "property_type": { "label": "نوع العقار", "format": "text" },
+                    "city": { "label": "المدينة", "format": "text" },
+                    "district": { "label": "الحي", "format": "text" },
+                    "area_sqm": { "label": "المساحة", "format": "text" },
+                    "bedrooms": { "label": "غرف", "format": "text" },
+                    "phone": { "label": "الجوال", "format": "text" },
+                    "is_verified": { "label": "موثّق", "format": "boolean" },
+                    "posted_at": { "label": "تاريخ النشر", "format": "text" },
+                    "url": { "label": "الرابط", "format": "link" }
+                }
+            }
+        }
+    }
+}
