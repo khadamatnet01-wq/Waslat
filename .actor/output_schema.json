@@ -1,0 +1,13 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "totalItems": {
+            "title": "إجمالي العقارات المستخرجة",
+            "type": "integer"
+        },
+        "searchQuery": {
+            "title": "كلمة البحث المستخدمة",
+            "type": "string"
+        }
+    }
+}
