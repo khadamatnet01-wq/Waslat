@@ -28,27 +28,33 @@ const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     maxConcurrency: 2,
     maxRequestsPerCrawl: maxResults + 50,
-    requestHandlerTimeoutSecs: 120,
-    navigationTimeoutSecs: 90,
+    requestHandlerTimeoutSecs: 180,
+    navigationTimeoutSecs: 60,
 
     async requestHandler({ page, request, log: reqLog }) {
 
         // ==========================================
-        // مسار 1: صفحة البحث — جمع بيانات الإعلانات
+        // مسار 1: صفحة البحث — جمع روابط الإعلانات
         // ==========================================
         if (request.userData.label === 'SEARCH') {
 
             const searchUrl = `https://wasalt.sa/ar/${listingType}/search?cityId=${cityId}&countryId=1&propertyFor=${listingType}&type=${propertyType}`;
             reqLog.info(`فتح صفحة البحث: ${searchUrl}`);
 
-            await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 90000 });
-            await page.waitForTimeout(3000);
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            try {
+                await page.waitForSelector('a[href*="/property/"], a[href*="/sale/"], a[href*="/rent/"]', { timeout: 15000 });
+            } catch {
+                reqLog.warning('لم تظهر بطاقات العقارات، سيتم المتابعة...');
+            }
+            await page.waitForTimeout(2000);
 
             let collectedUrls = new Set();
             let previousCount = 0;
             let staleRounds = 0;
 
-            while (collectedUrls.size < maxResults && staleRounds < 5) {
+            while (collectedUrls.size < maxResults && staleRounds < 6) {
 
                 const pageUrls = await page.evaluate(() => {
                     const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -56,13 +62,13 @@ const crawler = new PlaywrightCrawler({
                         .map(a => a.href)
                         .filter(href =>
                             href.includes('wasalt.sa') &&
-                            (href.includes('/property/') || href.match(/\/(sale|rent)\/[^/]+-\d+/))
+                            href.match(/wasalt\.sa\/(ar|en|property)\/(sale|rent|property)\/[^?#]+\d+/)
                         );
                 });
 
                 pageUrls.forEach(u => collectedUrls.add(u));
 
-                await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
+                await page.evaluate(() => window.scrollBy(0, window.innerHeight * 4));
                 await page.waitForTimeout(2500);
 
                 if (collectedUrls.size === previousCount) {
@@ -71,12 +77,11 @@ const crawler = new PlaywrightCrawler({
                     staleRounds = 0;
                 }
                 previousCount = collectedUrls.size;
-
                 reqLog.info(`تم جمع ${collectedUrls.size} رابط حتى الآن...`);
             }
 
             const urlsArray = Array.from(collectedUrls).slice(0, maxResults);
-            reqLog.info(`✅ إجمالي الروابط المجموعة: ${urlsArray.length}`);
+            reqLog.info(`✅ إجمالي الروابط: ${urlsArray.length}`);
 
             for (const url of urlsArray) {
                 await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
@@ -87,7 +92,7 @@ const crawler = new PlaywrightCrawler({
         // ==========================================
         } else if (request.userData.label === 'DETAIL') {
 
-            reqLog.info(`فتح تفاصيل العقار: ${request.url}`);
+            reqLog.info(`فتح تفاصيل: ${request.url}`);
 
             await page.route('**/*', (route) => {
                 const type = route.request().resourceType();
@@ -98,7 +103,7 @@ const crawler = new PlaywrightCrawler({
                 }
             });
 
-            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
             await page.waitForTimeout(2000);
 
             const nextDataText = await page.evaluate(() => {
@@ -133,14 +138,17 @@ const crawler = new PlaywrightCrawler({
                     const data = JSON.parse(nextDataText);
 
                     let propObj = null;
+
                     const findProp = (obj, depth = 0) => {
-                        if (depth > 10 || !obj || typeof obj !== 'object') return;
+                        if (depth > 15 || propObj || !obj || typeof obj !== 'object') return;
                         if (obj.property_info && obj.id && obj.property_files) {
                             propObj = obj;
                             return;
                         }
+                        if (obj.property_info && obj.id && !propObj) {
+                            propObj = obj;
+                        }
                         for (const val of Object.values(obj)) {
-                            if (propObj) return;
                             findProp(val, depth + 1);
                         }
                     };
@@ -152,14 +160,15 @@ const crawler = new PlaywrightCrawler({
                         const rega  = propObj.rega_raw_info  || {};
                         const files = propObj.property_files || {};
 
-                        item._raw_id    = String(propObj.id || '');
-                        item.name       = info.title || info.property_name || info.slug || '';
-                        item.priceSar   = String(info.sale_price || info.conversion_price || info.expected_rent || '');
-                        item.city       = info.city     || city;
-                        item.district   = info.zone     || info.district || '';
-                        item.address    = info.address  || '';
+                        item._raw_id     = String(propObj.id || '');
+                        item.name        = info.title || info.property_name || info.slug || '';
+                        item.priceSar    = String(info.sale_price || info.conversion_price || info.expected_rent || '');
+                        item.city        = info.city    || city;
+                        item.district    = info.zone    || info.district || '';
+                        item.address     = info.address || '';
                         item.is_verified = !!(propObj.is_verified || propObj.is_rega_prop);
-                        item.area_sqm   = propObj.floor_size || String(rega.property_area || '');
+                        item.area_sqm    = String(propObj.floor_size || rega.property_area || '');
+                        item.owner_name  = owner.ar_name || owner.name || '';
 
                         const attrs = propObj.attributes || [];
                         for (const attr of attrs) {
@@ -168,9 +177,11 @@ const crawler = new PlaywrightCrawler({
                             if (attr.key === 'builtUpArea' && !item.area_sqm) item.area_sqm = String(attr.value || '');
                         }
 
-                        item.owner_name = owner.ar_name || owner.name || '';
                         item.phone = rega.phone_number
                             || rega.responsible_employee_phone_number
+                            || owner.mobile
+                            || owner.phone
+                            || propObj.contact_number
                             || '';
 
                         const imgs = files.images || [];
@@ -180,9 +191,15 @@ const crawler = new PlaywrightCrawler({
                         );
                         item.has_image = item.images.length > 0;
 
-                        const rawPosted = propObj.published_at || propObj.created_at || '';
+                        const rawPosted = propObj.published_at || propObj.created_at || rega.creation_date || '';
                         if (rawPosted) {
-                            const d = new Date(rawPosted);
+                            let d;
+                            if (typeof rawPosted === 'string' && rawPosted.match(/^\d{2}\/\d{2}\/\d{4}$/)) {
+                                const [dd, mm, yyyy] = rawPosted.split('/');
+                                d = new Date(`${yyyy}-${mm}-${dd}`);
+                            } else {
+                                d = new Date(rawPosted);
+                            }
                             if (!isNaN(d.getTime())) {
                                 item.posted_at_iso = d.toISOString();
                                 item.posted_at = d.toLocaleString('ar-SA', {
@@ -226,7 +243,7 @@ const crawler = new PlaywrightCrawler({
             if (!item.phone) {
                 item.phone = await page.evaluate(() => {
                     const el = document.querySelector('a[href^="tel:"]');
-                    return el ? el.href.replace('tel:', '') : '';
+                    return el ? el.href.replace('tel:', '').trim() : '';
                 });
             }
 
