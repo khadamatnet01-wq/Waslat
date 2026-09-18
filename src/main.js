@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// أكتور Apify مخصّص لاستخراج إعلانات وصلت العقارية (wasalt.sa).
+// أكتور Apify لاستخراج إعلانات وصلت (wasalt.sa) عبر التصفح المباشر
 
 import { Actor } from 'apify';
 import { PlaywrightCrawler, log } from 'crawlee';
@@ -8,7 +8,6 @@ await Actor.init();
 
 const input = (await Actor.getInput()) || {};
 const {
-    search = '',
     city = 'الرياض',
     cityId = 273,
     listingType = 'sale',
@@ -23,58 +22,105 @@ const proxyConfiguration = await Actor.createProxyConfiguration(
 );
 
 const finalItems = [];
+const seenIds = new Set();
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
-    maxConcurrency: 3,
-    maxRequestsPerCrawl: maxResults + 30,
-    requestHandlerTimeoutSecs: 90,
-    navigationTimeoutSecs: 60,
+    maxConcurrency: 2,
+    maxRequestsPerCrawl: maxResults + 50,
+    requestHandlerTimeoutSecs: 120,
+    navigationTimeoutSecs: 90,
+
     async requestHandler({ page, request, log: reqLog }) {
 
-        // حظر الموارد الثقيلة لتوفير استهلاك البروكسي
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-                route.abort();
-            } else {
-                route.continue();
+        // ==========================================
+        // مسار 1: صفحة البحث — جمع بيانات الإعلانات
+        // ==========================================
+        if (request.userData.label === 'SEARCH') {
+
+            const searchUrl = `https://wasalt.sa/ar/${listingType}/search?cityId=${cityId}&countryId=1&propertyFor=${listingType}&type=${propertyType}`;
+            reqLog.info(`فتح صفحة البحث: ${searchUrl}`);
+
+            await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 90000 });
+            await page.waitForTimeout(3000);
+
+            let collectedUrls = new Set();
+            let previousCount = 0;
+            let staleRounds = 0;
+
+            while (collectedUrls.size < maxResults && staleRounds < 5) {
+
+                const pageUrls = await page.evaluate(() => {
+                    const anchors = Array.from(document.querySelectorAll('a[href]'));
+                    return anchors
+                        .map(a => a.href)
+                        .filter(href =>
+                            href.includes('wasalt.sa') &&
+                            (href.includes('/property/') || href.match(/\/(sale|rent)\/[^/]+-\d+/))
+                        );
+                });
+
+                pageUrls.forEach(u => collectedUrls.add(u));
+
+                await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
+                await page.waitForTimeout(2500);
+
+                if (collectedUrls.size === previousCount) {
+                    staleRounds++;
+                } else {
+                    staleRounds = 0;
+                }
+                previousCount = collectedUrls.size;
+
+                reqLog.info(`تم جمع ${collectedUrls.size} رابط حتى الآن...`);
             }
-        });
+
+            const urlsArray = Array.from(collectedUrls).slice(0, maxResults);
+            reqLog.info(`✅ إجمالي الروابط المجموعة: ${urlsArray.length}`);
+
+            for (const url of urlsArray) {
+                await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
+            }
 
         // ==========================================
-        // مسار 1: استخراج تفاصيل العقار من الداخل
+        // مسار 2: صفحة التفاصيل — استخراج بيانات العقار
         // ==========================================
-        if (request.userData.label === 'DETAIL') {
-            reqLog.info(`استخراج تفاصيل العقار: ${request.url}`);
-            await page.goto(request.url, { waitUntil: 'domcontentloaded' });
+        } else if (request.userData.label === 'DETAIL') {
 
-            // جلب البيانات من __NEXT_DATA__
+            reqLog.info(`فتح تفاصيل العقار: ${request.url}`);
+
+            await page.route('**/*', (route) => {
+                const type = route.request().resourceType();
+                if (['image', 'media', 'font'].includes(type)) {
+                    route.abort();
+                } else {
+                    route.continue();
+                }
+            });
+
+            await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await page.waitForTimeout(2000);
+
             const nextDataText = await page.evaluate(() => {
-                const script = document.querySelector('#__NEXT_DATA__');
-                return script ? script.innerText : null;
+                const el = document.querySelector('#__NEXT_DATA__');
+                return el ? el.textContent : null;
             });
 
             let item = {
-                title: '',
-                price_sar: '',
-                property_type: '',
-                listing_type: listingType,
+                name: '',
+                phone: '',
+                priceSar: '',
                 city: city,
                 district: '',
                 address: '',
                 area_sqm: '',
                 bedrooms: '',
                 bathrooms: '',
-                phone: '',
                 owner_name: '',
-                owner_type: '',
-                rega_license: '',
                 is_verified: false,
                 posted_at: '',
                 posted_at_iso: '',
                 updated_at: '',
-                description: '',
                 has_image: false,
                 images: [],
                 url: request.url,
@@ -86,63 +132,57 @@ const crawler = new PlaywrightCrawler({
                 try {
                     const data = JSON.parse(nextDataText);
 
-                    // البحث عن كائن العقار داخل بيانات Next.js
                     let propObj = null;
-                    JSON.stringify(data, (key, value) => {
-                        if (value && typeof value === 'object' && value.property_info && value.id) {
-                            propObj = value;
+                    const findProp = (obj, depth = 0) => {
+                        if (depth > 10 || !obj || typeof obj !== 'object') return;
+                        if (obj.property_info && obj.id && obj.property_files) {
+                            propObj = obj;
+                            return;
                         }
-                        return value;
-                    });
+                        for (const val of Object.values(obj)) {
+                            if (propObj) return;
+                            findProp(val, depth + 1);
+                        }
+                    };
+                    findProp(data);
 
                     if (propObj) {
-                        const info = propObj.property_info || {};
-                        const owner = propObj.property_owner || propObj.lead_contact_info || {};
-                        const regaInfo = propObj.rega_raw_info || {};
+                        const info  = propObj.property_info  || {};
+                        const owner = propObj.property_owner || {};
+                        const rega  = propObj.rega_raw_info  || {};
+                        const files = propObj.property_files || {};
 
-                        item._raw_id = String(propObj.id || '');
-                        item.title = info.title || info.property_name || '';
-                        item.price_sar = String(info.sale_price || info.conversion_price || '');
-                        item.property_type = info.property_sub_type || info.property_main_type || '';
-                        item.listing_type = info.property_for || listingType;
-                        item.city = info.city || city;
-                        item.district = info.zone || info.district || '';
-                        item.address = info.address || '';
-                        item.area_sqm = propObj.floor_size || '';
-                        item.is_verified = propObj.is_verified || propObj.is_rega_prop || false;
-                        item.description = propObj.rega_moj_desc || '';
+                        item._raw_id    = String(propObj.id || '');
+                        item.name       = info.title || info.property_name || info.slug || '';
+                        item.priceSar   = String(info.sale_price || info.conversion_price || info.expected_rent || '');
+                        item.city       = info.city     || city;
+                        item.district   = info.zone     || info.district || '';
+                        item.address    = info.address  || '';
+                        item.is_verified = !!(propObj.is_verified || propObj.is_rega_prop);
+                        item.area_sqm   = propObj.floor_size || String(rega.property_area || '');
 
-                        // استخراج الغرف والحمامات من الـ attributes
                         const attrs = propObj.attributes || [];
                         for (const attr of attrs) {
-                            if (attr.key === 'noOfBedrooms') item.bedrooms = String(attr.value || '');
+                            if (attr.key === 'noOfBedrooms')  item.bedrooms  = String(attr.value || '');
                             if (attr.key === 'noOfBathrooms') item.bathrooms = String(attr.value || '');
-                            if (attr.key === 'builtUpArea') item.area_sqm = item.area_sqm || String(attr.value || '');
+                            if (attr.key === 'builtUpArea' && !item.area_sqm) item.area_sqm = String(attr.value || '');
                         }
 
-                        // بيانات المالك والتواصل
-                        item.owner_name = owner.ar_name || owner.name || owner.owner_name || '';
-                        item.owner_type = owner.ar_user_role || owner.en_user_role || '';
-                        item.rega_license = owner.rega_adv_lic_no || regaInfo.ad_license_number || '';
-
-                        // رقم الجوال (من REGA أو المالك)
-                        item.phone = regaInfo.phone_number
-                            || regaInfo.responsible_employee_phone_number
+                        item.owner_name = owner.ar_name || owner.name || '';
+                        item.phone = rega.phone_number
+                            || rega.responsible_employee_phone_number
                             || '';
 
-                        // الصور
-                        const files = propObj.property_files || {};
                         const imgs = files.images || [];
                         item.images = imgs.map(img =>
-                            img.startsWith('http') ? img :
-                            `https://assets.wasalt.com/properties/${propObj.id}/images/${img}`
+                            img.startsWith('http') ? img
+                            : `https://assets.wasalt.com/properties/${propObj.id}/images/${img}`
                         );
                         item.has_image = item.images.length > 0;
 
-                        // وقت النشر
-                        const rawDate = propObj.published_at || propObj.created_at || '';
-                        if (rawDate) {
-                            const d = new Date(rawDate);
+                        const rawPosted = propObj.published_at || propObj.created_at || '';
+                        if (rawPosted) {
+                            const d = new Date(rawPosted);
                             if (!isNaN(d.getTime())) {
                                 item.posted_at_iso = d.toISOString();
                                 item.posted_at = d.toLocaleString('ar-SA', {
@@ -153,7 +193,6 @@ const crawler = new PlaywrightCrawler({
                             }
                         }
 
-                        // وقت التحديث
                         const rawUpdated = propObj.updated_at || '';
                         if (rawUpdated) {
                             const d = new Date(rawUpdated);
@@ -166,99 +205,75 @@ const crawler = new PlaywrightCrawler({
                             }
                         }
                     }
+
                 } catch (e) {
-                    reqLog.warning(`فشل تحليل بيانات Next.js: ${e.message}`);
+                    reqLog.warning(`فشل تحليل __NEXT_DATA__: ${e.message}`);
                 }
             }
 
-            // Fallback: استخراج من DOM إذا فشلت البيانات المخفية
-            if (!item.title) {
-                item.title = await page.evaluate(() =>
+            // Fallback من DOM
+            if (!item.name) {
+                item.name = await page.evaluate(() =>
                     document.querySelector('h1')?.innerText?.trim() || ''
                 );
             }
-            if (!item.price_sar) {
-                item.price_sar = await page.evaluate(() => {
-                    const priceEl = document.querySelector('[class*="price"], [class*="Price"]');
-                    return priceEl?.innerText?.replace(/[^\d]/g, '') || '';
+            if (!item.priceSar) {
+                item.priceSar = await page.evaluate(() => {
+                    const el = document.querySelector('[class*="price"], [class*="Price"]');
+                    return el?.innerText?.replace(/[^\d]/g, '') || '';
                 });
             }
+            if (!item.phone) {
+                item.phone = await page.evaluate(() => {
+                    const el = document.querySelector('a[href^="tel:"]');
+                    return el ? el.href.replace('tel:', '') : '';
+                });
+            }
+
+            if (!item.name && !item.priceSar) {
+                reqLog.warning(`⚠️ تجاهل إعلان فارغ: ${request.url}`);
+                return;
+            }
+            if (item._raw_id && seenIds.has(item._raw_id)) {
+                reqLog.info(`⚠️ تجاهل مكرر: ${item._raw_id}`);
+                return;
+            }
+            if (item._raw_id) seenIds.add(item._raw_id);
 
             finalItems.push(item);
             await Actor.pushData(item);
-            reqLog.info(`✅ عقار: ${item.title || 'بدون عنوان'} | السعر: ${item.price_sar || 'غير متوفر'} | الجوال: ${item.phone || 'غير متوفر'} | النشر: ${item.posted_at || 'غير متوفر'}`);
-
-        // ==========================================
-        // مسار 2: صفحة البحث وجمع روابط العقارات
-        // ==========================================
-        } else {
-            // بناء رابط البحث
-            let searchUrl = '';
-            if (search && search.trim()) {
-                searchUrl = `https://wasalt.sa/ar/${listingType}/search?cityId=${cityId}&countryId=1&propertyFor=${listingType}&type=${propertyType}&keyword=${encodeURIComponent(search)}`;
-            } else {
-                searchUrl = `https://wasalt.sa/ar/${listingType}/search?cityId=${cityId}&countryId=1&propertyFor=${listingType}&type=${propertyType}`;
-            }
-
-            reqLog.info(`البحث في وصلت: ${searchUrl}`);
-            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(2000);
-
-            let collectedUrls = new Set();
-            let attempts = 0;
-
-            while (collectedUrls.size < maxResults && attempts < 15) {
-                await page.mouse.wheel(0, 3000);
-                await page.waitForTimeout(1500);
-
-                const urls = await page.$$eval('a[href]', (anchors) => {
-                    return anchors
-                        .map(a => a.href)
-                        .filter(href => href.match(/wasalt\.sa\/(ar|en)\/(sale|rent|property)\/[^/]+\d+/));
-                });
-
-                urls.forEach(u => collectedUrls.add(u));
-                attempts++;
-
-                reqLog.info(`محاولة ${attempts}: تم العثور على ${collectedUrls.size} رابط حتى الآن...`);
-            }
-
-            const urlsArray = Array.from(collectedUrls).slice(0, maxResults);
-            reqLog.info(`🔍 تم العثور على ${urlsArray.length} عقار، جاري استخراج التفاصيل...`);
-
-            for (const url of urlsArray) {
-                await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
-            }
+            reqLog.info(`✅ ${item.name} | ${item.priceSar} ريال | ${item.phone || 'لا يوجد جوال'} | ${item.posted_at || 'لا يوجد تاريخ'}`);
         }
     },
+
     async failedRequestHandler({ request }, error) {
-        log.error(`❌ فشل الطلب ${request.url}: ${error.message}`);
+        log.error(`❌ فشل: ${request.url} — ${error.message}`);
     },
 });
 
-await crawler.run([{ url: 'https://wasalt.sa/', userData: { label: 'SEARCH' } }]);
+await crawler.run([{
+    url: `https://wasalt.sa/ar/${listingType}/search?cityId=${cityId}&countryId=1&propertyFor=${listingType}&type=${propertyType}`,
+    userData: { label: 'SEARCH' },
+}]);
 
-log.info(`🎉 اكتمل السحب! تم تصدير ${finalItems.length} عقار بكامل تفاصيلها.`);
+log.info(`🎉 اكتمل! تم استخراج ${finalItems.length} عقار.`);
 
-// ── إرسال الـ Webhook ─────────────────────────────────────
-if (webhookUrl && webhookUrl.trim() !== '') {
-    const defaultDatasetId = process.env.APIFY_DEFAULT_DATASET_ID;
-    const downloadUrl = `https://api.apify.com/v2/datasets/${defaultDatasetId}/items?format=json`;
-
+if (webhookUrl && webhookUrl.trim()) {
     try {
+        const datasetId = process.env.APIFY_DEFAULT_DATASET_ID;
         await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 status: 'success',
-                searchQuery: search || city,
+                city,
                 itemsCount: finalItems.length,
-                downloadUrl: downloadUrl,
+                downloadUrl: `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`,
             }),
         });
-        log.info('✅ تم إرسال الـ Webhook بنجاح.');
+        log.info('✅ Webhook أُرسل بنجاح.');
     } catch (err) {
-        log.error(`❌ فشل الاتصال بالـ Webhook: ${err.message}`);
+        log.error(`❌ فشل Webhook: ${err.message}`);
     }
 }
 
