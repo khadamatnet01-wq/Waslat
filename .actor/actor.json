@@ -1,0 +1,14 @@
+{
+    "actorSpecification": 1,
+    "name": "wasalt-scraper",
+    "title": "وصلت - سحب الإعلانات العقارية",
+    "description": "أكتور لاستخراج إعلانات العقارات من موقع وصلت السعودي بكامل تفاصيلها",
+    "version": "1.0",
+    "buildTag": "latest",
+    "environmentVariables": [],
+    "defaultRunOptions": {
+        "build": "latest",
+        "timeoutSecs": 3600,
+        "memoryMbytes": 2048
+    }
+}
