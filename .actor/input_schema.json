@@ -1,0 +1,68 @@
+{
+    "title": "إعدادات سحب وصلت",
+    "description": "ضبط معاملات البحث وعدد النتائج واختيار نوع العقار والمدينة",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "search": {
+            "title": "كلمة البحث (اختياري)",
+            "type": "string",
+            "description": "كلمة أو عبارة للبحث بها داخل وصلت، مثل: شقة رياض",
+            "editor": "textfield"
+        },
+        "city": {
+            "title": "اسم المدينة",
+            "type": "string",
+            "description": "اسم المدينة بالعربي",
+            "default": "الرياض",
+            "editor": "textfield"
+        },
+        "cityId": {
+            "title": "معرّف المدينة (cityId)",
+            "type": "integer",
+            "description": "الرياض=273، جدة=274، الدمام=275، مكة=276، المدينة=277",
+            "default": 273,
+            "editor": "number"
+        },
+        "listingType": {
+            "title": "نوع الإعلان",
+            "type": "string",
+            "description": "بيع أو إيجار",
+            "default": "sale",
+            "enum": ["sale", "rent"],
+            "enumTitles": ["بيع", "إيجار"],
+            "editor": "select"
+        },
+        "propertyType": {
+            "title": "نوع العقار",
+            "type": "string",
+            "description": "سكني أو تجاري",
+            "default": "residential",
+            "enum": ["residential", "commercial"],
+            "enumTitles": ["سكني", "تجاري"],
+            "editor": "select"
+        },
+        "maxResults": {
+            "title": "أقصى عدد للنتائج",
+            "type": "integer",
+            "description": "عدد العقارات المطلوب استخراجها",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 200,
+            "editor": "number"
+        },
+        "proxyConfiguration": {
+            "title": "إعدادات البروكسي",
+            "type": "object",
+            "description": "يُنصح باستخدام Apify Residential Proxy لتجنب الحجب",
+            "prefill": { "useApifyProxy": true, "groups": ["RESIDENTIAL"] },
+            "editor": "proxy"
+        },
+        "webhookUrl": {
+            "title": "رابط Webhook (اختياري)",
+            "type": "string",
+            "description": "رابط يُرسَل إليه إشعار JSON عند اكتمال السحب",
+            "editor": "textfield"
+        }
+    }
+}
