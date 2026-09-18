@@ -5,7 +5,6 @@
     "description": "أكتور لاستخراج إعلانات العقارات من موقع وصلت السعودي بكامل تفاصيلها",
     "version": "1.0",
     "buildTag": "latest",
-    "environmentVariables": [],
     "defaultRunOptions": {
         "build": "latest",
         "timeoutSecs": 3600,
