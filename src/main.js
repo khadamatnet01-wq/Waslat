@@ -1,5 +1,6 @@
 // -*- coding: utf-8 -*-
-// أكتور Apify لاستخراج إعلانات وصلت (wasalt.sa) عبر التصفح المباشر
+// أكتور Apify لاستخراج إعلانات وصلت (wasalt.sa)
+// الاستراتيجية: استخراج معظم البيانات من صفحة البحث مباشرةً، ثم فتح صفحة التفاصيل فقط لجلب الجوال والتاريخ
 
 import { Actor } from 'apify';
 import { PlaywrightCrawler, log } from 'crawlee';
@@ -34,7 +35,7 @@ const crawler = new PlaywrightCrawler({
     async requestHandler({ page, request, log: reqLog }) {
 
         // ==========================================
-        // مسار 1: صفحة البحث — جمع روابط الإعلانات
+        // مسار 1: صفحة البحث — استخراج البيانات الأساسية من الـ HTML مباشرة
         // ==========================================
         if (request.userData.label === 'SEARCH') {
 
@@ -44,59 +45,120 @@ const crawler = new PlaywrightCrawler({
             await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
             try {
-                await page.waitForSelector('a[href*="/property/"], a[href*="/sale/"], a[href*="/rent/"]', { timeout: 15000 });
+                await page.waitForSelector('a[href*="/property/"]', { timeout: 15000 });
             } catch {
                 reqLog.warning('لم تظهر بطاقات العقارات، سيتم المتابعة...');
             }
             await page.waitForTimeout(2000);
 
-            let collectedUrls = new Set();
-            let previousCount = 0;
+            let totalCollected = 0;
             let staleRounds = 0;
 
-            while (collectedUrls.size < maxResults && staleRounds < 6) {
+            while (totalCollected < maxResults && staleRounds < 5) {
 
-                const pageUrls = await page.evaluate(() => {
-                    const anchors = Array.from(document.querySelectorAll('a[href]'));
-                    return anchors
-                        .map(a => a.href)
-                        .filter(href =>
-                            href.includes('wasalt.sa') &&
-                            href.match(/wasalt\.sa\/(ar|en|property)\/(sale|rent|property)\/[^?#]+\d+/)
-                        );
-                });
+                const cards = await page.evaluate((listingType) => {
+                    const results = [];
+                    const links = Array.from(document.querySelectorAll('a[href*="/property/"]'));
 
-                pageUrls.forEach(u => collectedUrls.add(u));
+                    const seen = new Set();
+                    for (const link of links) {
+                        const href = link.href;
+                        const idMatch = href.match(/-(\d+)$/);
+                        if (!idMatch) continue;
+                        const id = idMatch[1];
+                        if (seen.has(id)) continue;
+                        seen.add(id);
 
-                await page.evaluate(() => window.scrollBy(0, window.innerHeight * 4));
-                await page.waitForTimeout(2500);
+                        const card = link.closest('div[class*="card"], div[class*="property"], div[class*="listing"], article, li') || link.parentElement?.parentElement;
 
-                if (collectedUrls.size === previousCount) {
+                        const cardText = card?.innerText || '';
+                        const priceMatch = cardText.match(/([\d,]+)\s*(ريال|ر\.س|SAR)?/);
+                        const price = priceMatch ? priceMatch[1].replace(/,/g, '') : '';
+
+                        const name = link.getAttribute('title') || link.innerText?.trim() || '';
+
+                        const addressEl = card?.querySelector('[class*="zone"], [class*="district"], [class*="address"], [class*="location"]');
+                        const address = addressEl?.innerText?.trim() || '';
+
+                        const imgEl = card?.querySelector('img');
+                        const imgSrc = imgEl?.src || imgEl?.getAttribute('data-src') || '';
+
+                        results.push({
+                            _raw_id: id,
+                            name: name.replace(/\n.*/s, '').trim(),
+                            priceSar: price,
+                            address: address,
+                            has_image: !!imgSrc,
+                            images: imgSrc ? [imgSrc] : [],
+                            url: href,
+                        });
+                    }
+                    return results;
+                }, listingType);
+
+                let newCount = 0;
+                for (const card of cards) {
+                    if (seenIds.has(card._raw_id)) continue;
+                    if (finalItems.length >= maxResults) break;
+                    seenIds.add(card._raw_id);
+
+                    card.city = city;
+                    card.district = '';
+                    card.area_sqm = '';
+                    card.bedrooms = '';
+                    card.bathrooms = '';
+                    card.listing_type = listingType;
+                    card.source = 'wasalt';
+                    card.phone = '';
+                    card.owner_name = '';
+                    card.is_verified = false;
+                    card.posted_at = '';
+                    card.posted_at_iso = '';
+                    card.updated_at = '';
+                    card.scanned_at = new Date().toISOString();
+
+                    if (card.address) {
+                        const parts = card.address.split('،');
+                        card.district = parts[0]?.trim() || '';
+                        card.city = parts[parts.length - 1]?.trim() || city;
+                    }
+
+                    finalItems.push(card);
+                    newCount++;
+                }
+
+                totalCollected = finalItems.length;
+                reqLog.info(`تم جمع ${totalCollected} إعلان حتى الآن...`);
+
+                if (newCount === 0) {
                     staleRounds++;
                 } else {
                     staleRounds = 0;
+                    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 4));
+                    await page.waitForTimeout(2500);
                 }
-                previousCount = collectedUrls.size;
-                reqLog.info(`تم جمع ${collectedUrls.size} رابط حتى الآن...`);
             }
 
-            const urlsArray = Array.from(collectedUrls).slice(0, maxResults);
-            reqLog.info(`✅ إجمالي الروابط: ${urlsArray.length}`);
+            reqLog.info(`✅ انتهى جمع ${finalItems.length} إعلان من صفحة البحث`);
 
-            for (const url of urlsArray) {
-                await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
+            for (const item of finalItems) {
+                await crawler.addRequests([{
+                    url: item.url,
+                    userData: { label: 'DETAIL', rawId: item._raw_id },
+                }]);
             }
 
         // ==========================================
-        // مسار 2: صفحة التفاصيل — استخراج بيانات العقار
+        // مسار 2: صفحة التفاصيل — جلب الجوال والتاريخ فقط
         // ==========================================
         } else if (request.userData.label === 'DETAIL') {
 
-            reqLog.info(`فتح تفاصيل: ${request.url}`);
+            const rawId = request.userData.rawId;
+            reqLog.info(`جلب تفاصيل العقار ${rawId}: ${request.url}`);
 
             await page.route('**/*', (route) => {
                 const type = route.request().resourceType();
-                if (['image', 'media', 'font'].includes(type)) {
+                if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
                     route.abort();
                 } else {
                     route.continue();
@@ -104,53 +166,33 @@ const crawler = new PlaywrightCrawler({
             });
 
             await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(1500);
 
             const nextDataText = await page.evaluate(() => {
                 const el = document.querySelector('#__NEXT_DATA__');
                 return el ? el.textContent : null;
             });
 
-            let item = {
-                name: '',
-                phone: '',
-                priceSar: '',
-                city: city,
-                district: '',
-                address: '',
-                area_sqm: '',
-                bedrooms: '',
-                bathrooms: '',
-                owner_name: '',
-                is_verified: false,
-                posted_at: '',
-                posted_at_iso: '',
-                updated_at: '',
-                has_image: false,
-                images: [],
-                url: request.url,
-                source: 'wasalt',
-                _raw_id: '',
-            };
+            let phone = '';
+            let posted_at = '';
+            let posted_at_iso = '';
+            let updated_at = '';
+            let bedrooms = '';
+            let bathrooms = '';
+            let area_sqm = '';
+            let district = '';
+            let owner_name = '';
+            let is_verified = false;
 
             if (nextDataText) {
                 try {
                     const data = JSON.parse(nextDataText);
 
                     let propObj = null;
-
                     const findProp = (obj, depth = 0) => {
                         if (depth > 15 || propObj || !obj || typeof obj !== 'object') return;
-                        if (obj.property_info && obj.id && obj.property_files) {
-                            propObj = obj;
-                            return;
-                        }
-                        if (obj.property_info && obj.id && !propObj) {
-                            propObj = obj;
-                        }
-                        for (const val of Object.values(obj)) {
-                            findProp(val, depth + 1);
-                        }
+                        if (obj.property_info && obj.id) { propObj = obj; return; }
+                        for (const val of Object.values(obj)) findProp(val, depth + 1);
                     };
                     findProp(data);
 
@@ -158,38 +200,22 @@ const crawler = new PlaywrightCrawler({
                         const info  = propObj.property_info  || {};
                         const owner = propObj.property_owner || {};
                         const rega  = propObj.rega_raw_info  || {};
-                        const files = propObj.property_files || {};
 
-                        item._raw_id     = String(propObj.id || '');
-                        item.name        = info.title || info.property_name || info.slug || '';
-                        item.priceSar    = String(info.sale_price || info.conversion_price || info.expected_rent || '');
-                        item.city        = info.city    || city;
-                        item.district    = info.zone    || info.district || '';
-                        item.address     = info.address || '';
-                        item.is_verified = !!(propObj.is_verified || propObj.is_rega_prop);
-                        item.area_sqm    = String(propObj.floor_size || rega.property_area || '');
-                        item.owner_name  = owner.ar_name || owner.name || '';
+                        phone = rega.phone_number
+                            || rega.responsible_employee_phone_number
+                            || owner.mobile || owner.phone || '';
+
+                        owner_name  = owner.ar_name || owner.name || '';
+                        is_verified = !!(propObj.is_verified || propObj.is_rega_prop);
+                        area_sqm    = String(propObj.floor_size || rega.property_area || '');
+                        district    = info.zone || info.district || '';
 
                         const attrs = propObj.attributes || [];
                         for (const attr of attrs) {
-                            if (attr.key === 'noOfBedrooms')  item.bedrooms  = String(attr.value || '');
-                            if (attr.key === 'noOfBathrooms') item.bathrooms = String(attr.value || '');
-                            if (attr.key === 'builtUpArea' && !item.area_sqm) item.area_sqm = String(attr.value || '');
+                            if (attr.key === 'noOfBedrooms')  bedrooms  = String(attr.value || '');
+                            if (attr.key === 'noOfBathrooms') bathrooms = String(attr.value || '');
+                            if (attr.key === 'builtUpArea' && !area_sqm) area_sqm = String(attr.value || '');
                         }
-
-                        item.phone = rega.phone_number
-                            || rega.responsible_employee_phone_number
-                            || owner.mobile
-                            || owner.phone
-                            || propObj.contact_number
-                            || '';
-
-                        const imgs = files.images || [];
-                        item.images = imgs.map(img =>
-                            img.startsWith('http') ? img
-                            : `https://assets.wasalt.com/properties/${propObj.id}/images/${img}`
-                        );
-                        item.has_image = item.images.length > 0;
 
                         const rawPosted = propObj.published_at || propObj.created_at || rega.creation_date || '';
                         if (rawPosted) {
@@ -201,8 +227,8 @@ const crawler = new PlaywrightCrawler({
                                 d = new Date(rawPosted);
                             }
                             if (!isNaN(d.getTime())) {
-                                item.posted_at_iso = d.toISOString();
-                                item.posted_at = d.toLocaleString('ar-SA', {
+                                posted_at_iso = d.toISOString();
+                                posted_at = d.toLocaleString('ar-SA', {
                                     timeZone: 'Asia/Riyadh',
                                     year: 'numeric', month: '2-digit', day: '2-digit',
                                     hour: '2-digit', minute: '2-digit',
@@ -214,7 +240,7 @@ const crawler = new PlaywrightCrawler({
                         if (rawUpdated) {
                             const d = new Date(rawUpdated);
                             if (!isNaN(d.getTime())) {
-                                item.updated_at = d.toLocaleString('ar-SA', {
+                                updated_at = d.toLocaleString('ar-SA', {
                                     timeZone: 'Asia/Riyadh',
                                     year: 'numeric', month: '2-digit', day: '2-digit',
                                     hour: '2-digit', minute: '2-digit',
@@ -222,48 +248,46 @@ const crawler = new PlaywrightCrawler({
                             }
                         }
                     }
-
                 } catch (e) {
                     reqLog.warning(`فشل تحليل __NEXT_DATA__: ${e.message}`);
                 }
             }
 
-            // Fallback من DOM
-            if (!item.name) {
-                item.name = await page.evaluate(() =>
-                    document.querySelector('h1')?.innerText?.trim() || ''
-                );
-            }
-            if (!item.priceSar) {
-                item.priceSar = await page.evaluate(() => {
-                    const el = document.querySelector('[class*="price"], [class*="Price"]');
-                    return el?.innerText?.replace(/[^\d]/g, '') || '';
-                });
-            }
-            if (!item.phone) {
-                item.phone = await page.evaluate(() => {
+            if (!phone) {
+                phone = await page.evaluate(() => {
                     const el = document.querySelector('a[href^="tel:"]');
                     return el ? el.href.replace('tel:', '').trim() : '';
                 });
             }
 
-            if (!item.name && !item.priceSar) {
-                reqLog.warning(`⚠️ تجاهل إعلان فارغ: ${request.url}`);
-                return;
-            }
-            if (item._raw_id && seenIds.has(item._raw_id)) {
-                reqLog.info(`⚠️ تجاهل مكرر: ${item._raw_id}`);
-                return;
-            }
-            if (item._raw_id) seenIds.add(item._raw_id);
+            const idx = finalItems.findIndex(i => i._raw_id === rawId);
+            if (idx !== -1) {
+                finalItems[idx].phone         = phone;
+                finalItems[idx].posted_at     = posted_at;
+                finalItems[idx].posted_at_iso = posted_at_iso;
+                finalItems[idx].updated_at    = updated_at;
+                finalItems[idx].bedrooms      = bedrooms  || finalItems[idx].bedrooms;
+                finalItems[idx].bathrooms     = bathrooms || finalItems[idx].bathrooms;
+                finalItems[idx].area_sqm      = area_sqm  || finalItems[idx].area_sqm;
+                finalItems[idx].district      = district  || finalItems[idx].district;
+                finalItems[idx].owner_name    = owner_name;
+                finalItems[idx].is_verified   = is_verified;
 
-            finalItems.push(item);
-            await Actor.pushData(item);
-            reqLog.info(`✅ ${item.name} | ${item.priceSar} ريال | ${item.phone || 'لا يوجد جوال'} | ${item.posted_at || 'لا يوجد تاريخ'}`);
+                await Actor.pushData(finalItems[idx]);
+                reqLog.info(`✅ ${finalItems[idx].name} | ${finalItems[idx].priceSar} ريال | ${phone || 'لا جوال'} | ${posted_at || 'لا تاريخ'}`);
+            }
         }
     },
 
     async failedRequestHandler({ request }, error) {
+        if (request.userData.label === 'DETAIL') {
+            const rawId = request.userData.rawId;
+            const idx = finalItems.findIndex(i => i._raw_id === rawId);
+            if (idx !== -1 && !finalItems[idx]._saved) {
+                finalItems[idx]._saved = true;
+                await Actor.pushData(finalItems[idx]);
+            }
+        }
         log.error(`❌ فشل: ${request.url} — ${error.message}`);
     },
 });
