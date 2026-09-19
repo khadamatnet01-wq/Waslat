@@ -1,6 +1,5 @@
 // -*- coding: utf-8 -*-
 // أكتور Apify لاستخراج إعلانات وصلت (wasalt.sa)
-// الاستراتيجية: استخراج معظم البيانات من صفحة البحث مباشرةً، ثم فتح صفحة التفاصيل فقط لجلب الجوال والتاريخ
 
 import { Actor } from 'apify';
 import { PlaywrightCrawler, log } from 'crawlee';
@@ -25,6 +24,18 @@ const proxyConfiguration = await Actor.createProxyConfiguration(
 const finalItems = [];
 const seenIds = new Set();
 
+// استخراج أول جوال سعودي من أي نص
+const extractPhone = (text) => {
+    if (!text) return '';
+    const match = text.match(/(?:05|5|9665|\+9665)[0-9]{8}/);
+    if (!match) return '';
+    let phone = match[0].replace(/\s/g, '');
+    if (phone.startsWith('5')) phone = '0' + phone;
+    if (phone.startsWith('9665')) phone = '0' + phone.slice(3);
+    if (phone.startsWith('+9665')) phone = '0' + phone.slice(4);
+    return phone;
+};
+
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     maxConcurrency: 2,
@@ -35,7 +46,7 @@ const crawler = new PlaywrightCrawler({
     async requestHandler({ page, request, log: reqLog }) {
 
         // ==========================================
-        // مسار 1: صفحة البحث — استخراج البيانات الأساسية من الـ HTML مباشرة
+        // مسار 1: صفحة البحث
         // ==========================================
         if (request.userData.label === 'SEARCH') {
 
@@ -51,16 +62,15 @@ const crawler = new PlaywrightCrawler({
             }
             await page.waitForTimeout(2000);
 
-            let totalCollected = 0;
             let staleRounds = 0;
 
-            while (totalCollected < maxResults && staleRounds < 5) {
+            while (finalItems.length < maxResults && staleRounds < 5) {
 
-                const cards = await page.evaluate((listingType) => {
+                const cards = await page.evaluate(() => {
                     const results = [];
+                    const seen = new Set();
                     const links = Array.from(document.querySelectorAll('a[href*="/property/"]'));
 
-                    const seen = new Set();
                     for (const link of links) {
                         const href = link.href;
                         const idMatch = href.match(/-(\d+)$/);
@@ -69,32 +79,20 @@ const crawler = new PlaywrightCrawler({
                         if (seen.has(id)) continue;
                         seen.add(id);
 
-                        const card = link.closest('div[class*="card"], div[class*="property"], div[class*="listing"], article, li') || link.parentElement?.parentElement;
-
+                        const card = link.closest('div, article, li') || link.parentElement?.parentElement;
                         const cardText = card?.innerText || '';
-                        const priceMatch = cardText.match(/([\d,]+)\s*(ريال|ر\.س|SAR)?/);
+                        const priceMatch = cardText.match(/([\d,]+)\s*(ريال|ر\.س)?/);
                         const price = priceMatch ? priceMatch[1].replace(/,/g, '') : '';
-
-                        const name = link.getAttribute('title') || link.innerText?.trim() || '';
-
+                        const name = link.getAttribute('title') || link.innerText?.trim().split('\n')[0] || '';
                         const addressEl = card?.querySelector('[class*="zone"], [class*="district"], [class*="address"], [class*="location"]');
                         const address = addressEl?.innerText?.trim() || '';
-
                         const imgEl = card?.querySelector('img');
                         const imgSrc = imgEl?.src || imgEl?.getAttribute('data-src') || '';
 
-                        results.push({
-                            _raw_id: id,
-                            name: name.replace(/\n.*/s, '').trim(),
-                            priceSar: price,
-                            address: address,
-                            has_image: !!imgSrc,
-                            images: imgSrc ? [imgSrc] : [],
-                            url: href,
-                        });
+                        results.push({ _raw_id: id, name: name.trim(), priceSar: price, address, has_image: !!imgSrc, images: imgSrc ? [imgSrc] : [], url: href });
                     }
                     return results;
-                }, listingType);
+                });
 
                 let newCount = 0;
                 for (const card of cards) {
@@ -127,8 +125,7 @@ const crawler = new PlaywrightCrawler({
                     newCount++;
                 }
 
-                totalCollected = finalItems.length;
-                reqLog.info(`تم جمع ${totalCollected} إعلان حتى الآن...`);
+                reqLog.info(`تم جمع ${finalItems.length} إعلان حتى الآن...`);
 
                 if (newCount === 0) {
                     staleRounds++;
@@ -139,7 +136,7 @@ const crawler = new PlaywrightCrawler({
                 }
             }
 
-            reqLog.info(`✅ انتهى جمع ${finalItems.length} إعلان من صفحة البحث`);
+            reqLog.info(`✅ انتهى جمع ${finalItems.length} إعلان`);
 
             for (const item of finalItems) {
                 await crawler.addRequests([{
@@ -149,12 +146,12 @@ const crawler = new PlaywrightCrawler({
             }
 
         // ==========================================
-        // مسار 2: صفحة التفاصيل — جلب الجوال والتاريخ فقط
+        // مسار 2: صفحة التفاصيل
         // ==========================================
         } else if (request.userData.label === 'DETAIL') {
 
             const rawId = request.userData.rawId;
-            reqLog.info(`جلب تفاصيل العقار ${rawId}: ${request.url}`);
+            reqLog.info(`جلب تفاصيل العقار ${rawId}`);
 
             await page.route('**/*', (route) => {
                 const type = route.request().resourceType();
@@ -168,12 +165,15 @@ const crawler = new PlaywrightCrawler({
             await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
             await page.waitForTimeout(1500);
 
+            // استخراج كل النص المرئي للصفحة للبحث عن الجوال
+            const pageText = await page.evaluate(() => document.body.innerText || '');
+            let phone = extractPhone(pageText);
+
             const nextDataText = await page.evaluate(() => {
                 const el = document.querySelector('#__NEXT_DATA__');
                 return el ? el.textContent : null;
             });
 
-            let phone = '';
             let posted_at = '';
             let posted_at_iso = '';
             let updated_at = '';
@@ -183,6 +183,7 @@ const crawler = new PlaywrightCrawler({
             let district = '';
             let owner_name = '';
             let is_verified = false;
+            let rega_license = '';
 
             if (nextDataText) {
                 try {
@@ -201,14 +202,16 @@ const crawler = new PlaywrightCrawler({
                         const owner = propObj.property_owner || {};
                         const rega  = propObj.rega_raw_info  || {};
 
-                        phone = rega.phone_number
+                        const nextPhone = rega.phone_number
                             || rega.responsible_employee_phone_number
                             || owner.mobile || owner.phone || '';
+                        if (nextPhone) phone = nextPhone;
 
-                        owner_name  = owner.ar_name || owner.name || '';
-                        is_verified = !!(propObj.is_verified || propObj.is_rega_prop);
-                        area_sqm    = String(propObj.floor_size || rega.property_area || '');
-                        district    = info.zone || info.district || '';
+                        owner_name   = owner.ar_name || owner.name || '';
+                        is_verified  = !!(propObj.is_verified || propObj.is_rega_prop);
+                        area_sqm     = String(propObj.floor_size || rega.property_area || '');
+                        district     = info.zone || info.district || '';
+                        rega_license = rega.ad_license_number || owner.rega_adv_lic_no || '';
 
                         const attrs = propObj.attributes || [];
                         for (const attr of attrs) {
@@ -217,7 +220,7 @@ const crawler = new PlaywrightCrawler({
                             if (attr.key === 'builtUpArea' && !area_sqm) area_sqm = String(attr.value || '');
                         }
 
-                        const rawPosted = propObj.published_at || propObj.created_at || rega.creation_date || '';
+                        const rawPosted = propObj.published_at || propObj.created_at || rega.creation_date || rega.issue_date || '';
                         if (rawPosted) {
                             let d;
                             if (typeof rawPosted === 'string' && rawPosted.match(/^\d{2}\/\d{2}\/\d{4}$/)) {
@@ -253,11 +256,32 @@ const crawler = new PlaywrightCrawler({
                 }
             }
 
+            // Fallback: جوال من tel:
             if (!phone) {
-                phone = await page.evaluate(() => {
+                const telHref = await page.evaluate(() => {
                     const el = document.querySelector('a[href^="tel:"]');
-                    return el ? el.href.replace('tel:', '').trim() : '';
+                    return el ? el.href : '';
                 });
+                if (telHref) phone = telHref.replace('tel:', '').trim();
+            }
+
+            // تاريخ النشر من DOM كـ Fallback
+            if (!posted_at) {
+                const domDate = await page.evaluate(() => {
+                    const el = document.querySelector('time, [class*="date"], [class*="time"]');
+                    return el?.getAttribute('datetime') || el?.innerText?.trim() || '';
+                });
+                if (domDate) {
+                    const d = new Date(domDate);
+                    if (!isNaN(d.getTime())) {
+                        posted_at_iso = d.toISOString();
+                        posted_at = d.toLocaleString('ar-SA', {
+                            timeZone: 'Asia/Riyadh',
+                            year: 'numeric', month: '2-digit', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit',
+                        });
+                    }
+                }
             }
 
             const idx = finalItems.findIndex(i => i._raw_id === rawId);
@@ -272,6 +296,7 @@ const crawler = new PlaywrightCrawler({
                 finalItems[idx].district      = district  || finalItems[idx].district;
                 finalItems[idx].owner_name    = owner_name;
                 finalItems[idx].is_verified   = is_verified;
+                finalItems[idx].rega_license  = rega_license;
 
                 await Actor.pushData(finalItems[idx]);
                 reqLog.info(`✅ ${finalItems[idx].name} | ${finalItems[idx].priceSar} ريال | ${phone || 'لا جوال'} | ${posted_at || 'لا تاريخ'}`);
