@@ -27,12 +27,12 @@ const seenIds = new Set();
 // استخراج أول جوال سعودي من أي نص
 const extractPhone = (text) => {
     if (!text) return '';
-    const match = text.match(/(?:05|5|9665|\+9665)[0-9]{8}/);
+    const match = text.match(/(?:\+?966|0)5[0-9]{8}/);
     if (!match) return '';
-    let phone = match[0].replace(/\s/g, '');
-    if (phone.startsWith('5')) phone = '0' + phone;
-    if (phone.startsWith('9665')) phone = '0' + phone.slice(3);
+    let phone = match[0].replace(/\s|-/g, '');
     if (phone.startsWith('+9665')) phone = '0' + phone.slice(4);
+    if (phone.startsWith('9665'))  phone = '0' + phone.slice(3);
+    if (phone.startsWith('5'))     phone = '0' + phone;
     return phone;
 };
 
@@ -89,7 +89,15 @@ const crawler = new PlaywrightCrawler({
                         const imgEl = card?.querySelector('img');
                         const imgSrc = imgEl?.src || imgEl?.getAttribute('data-src') || '';
 
-                        results.push({ _raw_id: id, name: name.trim(), priceSar: price, address, has_image: !!imgSrc, images: imgSrc ? [imgSrc] : [], url: href });
+                        results.push({
+                            _raw_id: id,
+                            name: name.trim(),
+                            priceSar: price,
+                            address,
+                            has_image: !!imgSrc,
+                            images: imgSrc ? [imgSrc] : [],
+                            url: href,
+                        });
                     }
                     return results;
                 });
@@ -100,25 +108,26 @@ const crawler = new PlaywrightCrawler({
                     if (finalItems.length >= maxResults) break;
                     seenIds.add(card._raw_id);
 
-                    card.city = city;
-                    card.district = '';
-                    card.area_sqm = '';
-                    card.bedrooms = '';
-                    card.bathrooms = '';
+                    card.city         = city;
+                    card.district     = '';
+                    card.area_sqm     = '';
+                    card.bedrooms     = '';
+                    card.bathrooms    = '';
                     card.listing_type = listingType;
-                    card.source = 'wasalt';
-                    card.phone = '';
-                    card.owner_name = '';
-                    card.is_verified = false;
-                    card.posted_at = '';
+                    card.source       = 'wasalt';
+                    card.phone        = '';
+                    card.owner_name   = '';
+                    card.rega_license = '';
+                    card.is_verified  = false;
+                    card.posted_at    = '';
                     card.posted_at_iso = '';
-                    card.updated_at = '';
-                    card.scanned_at = new Date().toISOString();
+                    card.updated_at   = '';
+                    card.scanned_at   = new Date().toISOString();
 
                     if (card.address) {
                         const parts = card.address.split('،');
                         card.district = parts[0]?.trim() || '';
-                        card.city = parts[parts.length - 1]?.trim() || city;
+                        card.city     = parts[parts.length - 1]?.trim() || city;
                     }
 
                     finalItems.push(card);
@@ -153,9 +162,10 @@ const crawler = new PlaywrightCrawler({
             const rawId = request.userData.rawId;
             reqLog.info(`جلب تفاصيل العقار ${rawId}`);
 
+            // حظر الصور والفيديو فقط — نترك الـ stylesheet لأن النص قد يحتاجه
             await page.route('**/*', (route) => {
                 const type = route.request().resourceType();
-                if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+                if (['image', 'media', 'font'].includes(type)) {
                     route.abort();
                 } else {
                     route.continue();
@@ -163,27 +173,47 @@ const crawler = new PlaywrightCrawler({
             });
 
             await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            try {
+                await page.waitForSelector('[class*="description"], [class*="body"], [class*="desc"]', { timeout: 8000 });
+            } catch { /* متابعة */ }
             await page.waitForTimeout(1500);
 
-            // استخراج كل النص المرئي للصفحة للبحث عن الجوال
-            const pageText = await page.evaluate(() => document.body.innerText || '');
-            let phone = extractPhone(pageText);
+            // قراءة نص الوصف الكامل بما فيه المخفي بـ CSS
+            const descriptionText = await page.evaluate(() => {
+                const selectors = [
+                    '[class*="description"]',
+                    '[class*="body"]',
+                    '[class*="desc"]',
+                    '[class*="property-info"]',
+                    '[class*="detail"]',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.textContent.trim().length > 50) {
+                        return el.textContent.trim();
+                    }
+                }
+                return document.body.innerText || '';
+            });
+
+            let phone = extractPhone(descriptionText);
 
             const nextDataText = await page.evaluate(() => {
                 const el = document.querySelector('#__NEXT_DATA__');
                 return el ? el.textContent : null;
             });
 
-            let posted_at = '';
+            let posted_at     = '';
             let posted_at_iso = '';
-            let updated_at = '';
-            let bedrooms = '';
-            let bathrooms = '';
-            let area_sqm = '';
-            let district = '';
-            let owner_name = '';
-            let is_verified = false;
-            let rega_license = '';
+            let updated_at    = '';
+            let bedrooms      = '';
+            let bathrooms     = '';
+            let area_sqm      = '';
+            let district      = '';
+            let owner_name    = '';
+            let is_verified   = false;
+            let rega_license  = '';
 
             if (nextDataText) {
                 try {
@@ -202,10 +232,17 @@ const crawler = new PlaywrightCrawler({
                         const owner = propObj.property_owner || {};
                         const rega  = propObj.rega_raw_info  || {};
 
+                        // جوال من __NEXT_DATA__ — أولوية على regex
                         const nextPhone = rega.phone_number
                             || rega.responsible_employee_phone_number
                             || owner.mobile || owner.phone || '';
                         if (nextPhone) phone = nextPhone;
+
+                        // جوال من نص الوصف داخل __NEXT_DATA__
+                        if (!phone) {
+                            const bodyText = propObj.rega_moj_desc || info.description || '';
+                            phone = extractPhone(bodyText);
+                        }
 
                         owner_name   = owner.ar_name || owner.name || '';
                         is_verified  = !!(propObj.is_verified || propObj.is_rega_prop);
@@ -256,7 +293,7 @@ const crawler = new PlaywrightCrawler({
                 }
             }
 
-            // Fallback: جوال من tel:
+            // Fallback: جوال من رابط tel:
             if (!phone) {
                 const telHref = await page.evaluate(() => {
                     const el = document.querySelector('a[href^="tel:"]');
@@ -265,10 +302,10 @@ const crawler = new PlaywrightCrawler({
                 if (telHref) phone = telHref.replace('tel:', '').trim();
             }
 
-            // تاريخ النشر من DOM كـ Fallback
+            // Fallback: تاريخ من DOM
             if (!posted_at) {
                 const domDate = await page.evaluate(() => {
-                    const el = document.querySelector('time, [class*="date"], [class*="time"]');
+                    const el = document.querySelector('time[datetime], [class*="date"], [class*="publish"]');
                     return el?.getAttribute('datetime') || el?.innerText?.trim() || '';
                 });
                 if (domDate) {
