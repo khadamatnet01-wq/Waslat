@@ -1,8 +1,8 @@
-// -*- coding: utf-8 -*-
+  // -*- coding: utf-8 -*-
 // ============================================================
 // WASALT / وصلت - Apify Actor
-// استخراج الإعلانات + الهاتف + بيانات الإعلان
-// يدعم: todayOnly = true / false
+// البحث بالمدينة + الحي + نوع العقار
+// يدعم: اليوم فقط + استخراج الهاتف
 // ============================================================
 
 import { Actor } from 'apify';
@@ -10,30 +10,19 @@ import { PlaywrightCrawler, log } from 'crawlee';
 
 await Actor.init();
 
-// ============================================================
-// INPUT
-// ============================================================
-
 const input = (await Actor.getInput()) || {};
 
 const {
     city = 'الرياض',
-    cityId = 273,
+    district = '',
     listingType = 'sale',
     propertyType = 'residential',
     maxResults = 20,
-
-    // جديد:
-    // true  = إعلانات اليوم فقط
-    // false = جميع الإعلانات
     todayOnly = false,
-
-    // عدد دورات التمرير في صفحة البحث
     maxScrollRounds = 20,
-
+    fetchPhoneFromDetail = true,
     proxyConfiguration: proxyInput,
-
-    webhookUrl = '',
+    webhookUrl = ''
 } = input;
 
 // ============================================================
@@ -44,77 +33,64 @@ const proxyConfiguration =
     await Actor.createProxyConfiguration(
         proxyInput || {
             useApifyProxy: true,
-            groups: ['RESIDENTIAL'],
+            groups: ['RESIDENTIAL']
         }
     );
 
 // ============================================================
-// LOG
+// STATE
 // ============================================================
 
-log.info(
-    `🔍 todayOnly المُستلم = ${JSON.stringify(input.todayOnly)}`
-);
-
-log.info(
-    `🔍 todayOnly المستخدم فعلياً = ${todayOnly}`
-);
-
-log.info(
-    `🔍 المدينة = ${city} | cityId = ${cityId} | النوع = ${listingType} | propertyType = ${propertyType}`
-);
-
-// ============================================================
-// STORAGE
-// ============================================================
-
-const finalItems = [];
+const candidates = [];
 const seenIds = new Set();
-const detailQueuedIds = new Set();
+const queuedIds = new Set();
 
-// عدد الإعلانات التي تم حفظها فعلياً
 let savedCount = 0;
 
 // ============================================================
 // HELPERS
 // ============================================================
 
+function cleanText(value) {
+    return String(value || '')
+        .replace(/\u200e/g, '')
+        .replace(/\u200f/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 // ------------------------------------------------------------
-// استخراج رقم هاتف سعودي
+// الهاتف
 // ------------------------------------------------------------
 
-function extractPhone(text) {
-    if (!text) return '';
+function extractPhone(value) {
+    if (!value) return '';
 
-    const value = String(text)
-        .replace(/[\u200e\u200f]/g, ' ');
+    let text = String(value)
+        .replace(/[()\-\s]/g, '');
 
     const patterns = [
-        /(?:\+?966[\s-]?)?05[0-9]{8}/g,
-        /(?:\+?966[\s-]?)?5[0-9]{8}/g,
+        /(?:\+966|966)?05\d{8}/,
+        /(?:\+966|966)?5\d{8}/
     ];
 
     for (const pattern of patterns) {
-        const matches = value.match(pattern);
+        const match = text.match(pattern);
 
-        if (!matches) continue;
+        if (!match) continue;
 
-        for (let phone of matches) {
-            phone = phone
-                .replace(/\s/g, '')
-                .replace(/-/g, '');
+        let phone = match[0];
 
-            if (phone.startsWith('+9665')) {
-                phone = '0' + phone.slice(4);
-            } else if (phone.startsWith('9665')) {
-                phone = '0' + phone.slice(3);
-            } else if (phone.startsWith('5')) {
-                phone = '0' + phone;
-            }
+        if (phone.startsWith('+966')) {
+            phone = '0' + phone.slice(4);
+        } else if (phone.startsWith('966')) {
+            phone = '0' + phone.slice(3);
+        } else if (phone.startsWith('5')) {
+            phone = '0' + phone;
+        }
 
-            if (/^05[0-9]{8}$/.test(phone)) {
-                return phone;
-            }
+        if (/^05\d{8}$/.test(phone)) {
+            return phone;
         }
     }
 
@@ -122,84 +98,58 @@ function extractPhone(text) {
 }
 
 // ------------------------------------------------------------
-// تحويل التاريخ إلى Date
+// التاريخ
 // ------------------------------------------------------------
 
 function parseDate(value) {
     if (!value) return null;
 
-    try {
-        // dd/mm/yyyy
-        if (
-            typeof value === 'string' &&
-            /^\d{2}\/\d{2}\/\d{4}$/.test(value)
-        ) {
-            const [dd, mm, yyyy] =
-                value.split('/');
+    if (
+        typeof value === 'string' &&
+        /^\d{2}\/\d{2}\/\d{4}$/.test(value)
+    ) {
+        const [d, m, y] = value.split('/');
 
-            const date =
-                new Date(
-                    `${yyyy}-${mm}-${dd}T00:00:00+03:00`
-                );
-
-            if (!isNaN(date.getTime())) {
-                return date;
-            }
-        }
-
-        const date = new Date(value);
+        const date = new Date(
+            `${y}-${m}-${d}T00:00:00+03:00`
+        );
 
         if (!isNaN(date.getTime())) {
             return date;
         }
-    } catch {
-        // ignore
     }
 
-    return null;
+    const date = new Date(value);
+
+    return isNaN(date.getTime())
+        ? null
+        : date;
 }
 
-// ------------------------------------------------------------
-// تاريخ اليوم في الرياض
-// ------------------------------------------------------------
-
-function getRiyadhDateString(date = new Date()) {
+function riyadhDate(value = new Date()) {
     return new Intl.DateTimeFormat(
         'en-CA',
         {
             timeZone: 'Asia/Riyadh',
             year: 'numeric',
             month: '2-digit',
-            day: '2-digit',
+            day: '2-digit'
         }
-    ).format(date);
+    ).format(value);
 }
 
-// ------------------------------------------------------------
-// هل التاريخ هو اليوم في الرياض؟
-// ------------------------------------------------------------
-
-function isTodayRiyadh(value) {
+function isToday(value) {
     const date = parseDate(value);
 
-    if (!date) {
-        return false;
-    }
+    if (!date) return false;
 
-    const target =
-        getRiyadhDateString(date);
-
-    const today =
-        getRiyadhDateString(new Date());
-
-    return target === today;
+    return (
+        riyadhDate(date) ===
+        riyadhDate()
+    );
 }
 
-// ------------------------------------------------------------
-// تنسيق تاريخ الرياض
-// ------------------------------------------------------------
-
-function formatRiyadhDate(value) {
+function formatDate(value) {
     const date = parseDate(value);
 
     if (!date) return '';
@@ -212,10 +162,30 @@ function formatRiyadhDate(value) {
             month: '2-digit',
             day: '2-digit',
             hour: '2-digit',
-            minute: '2-digit',
+            minute: '2-digit'
         }
     );
 }
+
+// ============================================================
+// BUILD SEARCH PAGE
+// ============================================================
+
+const searchUrl =
+    `https://wasalt.sa/ar/${listingType}/search`;
+
+log.info('==========================================');
+log.info('🚀 بدء أكتور وصلت');
+log.info(`📍 المدينة: ${city}`);
+log.info(`🏘️ الحي: ${district || 'جميع الأحياء'}`);
+log.info(`🏠 النوع: ${propertyType}`);
+log.info(
+    `📅 اليوم فقط: ${todayOnly}`
+);
+log.info(
+    `📞 استخراج الهاتف: ${fetchPhoneFromDetail}`
+);
+log.info('==========================================');
 
 // ============================================================
 // CRAWLER
@@ -225,27 +195,22 @@ const crawler = new PlaywrightCrawler({
 
     proxyConfiguration,
 
-    // لا نرفع التوازي كثيراً حتى لا يتعرض الموقع للضغط
     maxConcurrency: 2,
 
     maxRequestsPerCrawl:
         Math.max(
-            Number(maxResults) * 10,
+            Number(maxResults) * 8,
             100
         ),
 
     requestHandlerTimeoutSecs: 180,
 
-    navigationTimeoutSecs: 60,
-
-    // ========================================================
-    // REQUEST HANDLER
-    // ========================================================
+    navigationTimeoutSecs: 60000,
 
     async requestHandler({
         page,
         request,
-        log: reqLog,
+        log: reqLog
     }) {
 
         // ====================================================
@@ -253,18 +218,12 @@ const crawler = new PlaywrightCrawler({
         // ====================================================
 
         if (
-            request.userData.label === 'SEARCH'
+            request.userData.label ===
+            'SEARCH'
         ) {
 
-            const searchUrl =
-                `https://wasalt.sa/ar/${listingType}/search` +
-                `?cityId=${cityId}` +
-                `&countryId=1` +
-                `&propertyFor=${listingType}` +
-                `&type=${propertyType}`;
-
             reqLog.info(
-                `🌐 فتح صفحة البحث: ${searchUrl}`
+                `🌐 فتح: ${searchUrl}`
             );
 
             await page.goto(
@@ -272,36 +231,52 @@ const crawler = new PlaywrightCrawler({
                 {
                     waitUntil:
                         'domcontentloaded',
-                    timeout: 60000,
+                    timeout: 60000
                 }
             );
 
-            try {
-                await page.waitForSelector(
-                    'a[href*="/property/"]',
-                    {
-                        timeout: 15000,
-                    }
-                );
-            } catch {
-                reqLog.warning(
-                    '⚠️ لم تظهر بطاقات العقارات مباشرة...'
-                );
-            }
+            await page.waitForTimeout(2500);
 
-            await page.waitForTimeout(2000);
+            // =================================================
+            // اختيار المدينة والحي
+            // =================================================
 
-            // ------------------------------------------------
-            // في الوضع العادي:
-            // نتوقف عند maxResults.
-            //
-            // في todayOnly:
-            // لا نتوقف بمجرد العثور على maxResults
-            // لأننا لا نعرف تاريخ الإعلان إلا من صفحة التفاصيل.
-            // ------------------------------------------------
+            await selectSearchLocation(
+                page,
+                city,
+                district,
+                reqLog
+            );
 
-            let staleRounds = 0;
+            // =================================================
+            // محاولة تحديد نوع العقار
+            // =================================================
+
+            await selectPropertyType(
+                page,
+                propertyType,
+                reqLog
+            );
+
+            await page.waitForTimeout(1500);
+
+            // =================================================
+            // الضغط على بحث
+            // =================================================
+
+            await clickSearch(
+                page,
+                reqLog
+            );
+
+            await page.waitForTimeout(3000);
+
+            // =================================================
+            // جمع النتائج
+            // =================================================
+
             let previousCount = 0;
+            let staleRounds = 0;
 
             for (
                 let round = 1;
@@ -309,143 +284,10 @@ const crawler = new PlaywrightCrawler({
                 round++
             ) {
 
-                // --------------------------------------------
-                // استخراج البطاقات الحالية
-                // --------------------------------------------
-
                 const cards =
-                    await page.evaluate(() => {
+                    await extractCards(page);
 
-                        const results = [];
-
-                        const seen =
-                            new Set();
-
-                        const links =
-                            Array.from(
-                                document.querySelectorAll(
-                                    'a[href*="/property/"]'
-                                )
-                            );
-
-                        for (
-                            const link of links
-                        ) {
-
-                            const href =
-                                link.href;
-
-                            if (!href) continue;
-
-                            // بعض الروابط قد تحتوي query/hash
-                            const cleanHref =
-                                href.split('?')[0]
-                                    .split('#')[0];
-
-                            const idMatch =
-                                cleanHref.match(
-                                    /-(\d+)$/
-                                );
-
-                            if (!idMatch) {
-                                continue;
-                            }
-
-                            const id =
-                                idMatch[1];
-
-                            if (seen.has(id)) {
-                                continue;
-                            }
-
-                            seen.add(id);
-
-                            const card =
-                                link.closest(
-                                    'div, article, li'
-                                ) ||
-                                link.parentElement?.parentElement;
-
-                            const cardText =
-                                card?.innerText || '';
-
-                            const priceMatch =
-                                cardText.match(
-                                    /([\d,]+)\s*(ريال|ر\.س)?/
-                                );
-
-                            const price =
-                                priceMatch
-                                    ? priceMatch[1]
-                                        .replace(/,/g, '')
-                                    : '';
-
-                            const name =
-                                link.getAttribute(
-                                    'title'
-                                ) ||
-                                link.innerText
-                                    ?.trim()
-                                    .split('\n')[0] ||
-                                '';
-
-                            const addressEl =
-                                card?.querySelector(
-                                    '[class*="zone"],' +
-                                    '[class*="district"],' +
-                                    '[class*="address"],' +
-                                    '[class*="location"]'
-                                );
-
-                            const address =
-                                addressEl
-                                    ?.innerText
-                                    ?.trim() || '';
-
-                            const imgEl =
-                                card?.querySelector(
-                                    'img'
-                                );
-
-                            const imgSrc =
-                                imgEl?.src ||
-                                imgEl?.getAttribute(
-                                    'data-src'
-                                ) ||
-                                '';
-
-                            results.push({
-                                _raw_id: id,
-
-                                name:
-                                    name.trim(),
-
-                                priceSar:
-                                    price,
-
-                                address,
-
-                                has_image:
-                                    !!imgSrc,
-
-                                images:
-                                    imgSrc
-                                        ? [imgSrc]
-                                        : [],
-
-                                url:
-                                    cleanHref,
-                            });
-                        }
-
-                        return results;
-                    });
-
-                // --------------------------------------------
-                // إضافة الإعلانات الجديدة
-                // --------------------------------------------
-
-                let newCount = 0;
+                let added = 0;
 
                 for (
                     const card of cards
@@ -453,127 +295,96 @@ const crawler = new PlaywrightCrawler({
 
                     if (
                         seenIds.has(
-                            card._raw_id
+                            card.id
                         )
                     ) {
                         continue;
                     }
 
-                    // في الوضع العادي فقط:
-                    // نتوقف عند العدد المطلوب.
                     if (
                         !todayOnly &&
-                        finalItems.length >=
-                            Number(maxResults)
+                        candidates.length >=
+                        Number(maxResults)
                     ) {
                         break;
                     }
 
-                    seenIds.add(
-                        card._raw_id
-                    );
+                    seenIds.add(card.id);
 
-                    card.city =
-                        city;
+                    candidates.push({
+                        _raw_id: card.id,
 
-                    card.district =
-                        '';
+                        url: card.url,
 
-                    card.area_sqm =
-                        '';
+                        title:
+                            card.title,
 
-                    card.bedrooms =
-                        '';
+                        priceSar:
+                            card.priceSar,
 
-                    card.bathrooms =
-                        '';
+                        address:
+                            card.address,
 
-                    card.listing_type =
-                        listingType;
+                        city:
+                            city,
 
-                    card.source =
-                        'wasalt';
+                        district:
+                            card.district ||
+                            district,
 
-                    card.phone =
-                        '';
+                        listing_type:
+                            listingType,
 
-                    card.owner_name =
-                        '';
+                        property_type:
+                            propertyType,
 
-                    card.rega_license =
-                        '';
+                        source:
+                            'wasalt',
 
-                    card.is_verified =
-                        false;
+                        phone: '',
 
-                    card.posted_at =
-                        '';
+                        owner_name: '',
 
-                    card.posted_at_iso =
-                        '';
+                        area_sqm: '',
 
-                    card.updated_at =
-                        '';
+                        bedrooms: '',
 
-                    card.scanned_at =
-                        new Date().toISOString();
+                        bathrooms: '',
 
-                    card._saved =
-                        false;
+                        rega_license: '',
 
-                    // ----------------------------------------
-                    // العنوان
-                    // ----------------------------------------
+                        is_verified: false,
 
-                    if (card.address) {
+                        posted_at: '',
 
-                        const parts =
-                            card.address.split(
-                                '،'
-                            );
+                        posted_at_iso: '',
 
-                        card.district =
-                            parts[0]
-                                ?.trim() || '';
+                        updated_at: '',
 
-                        card.city =
-                            parts[
-                                parts.length - 1
-                            ]
-                                ?.trim() ||
-                            city;
-                    }
+                        scanned_at:
+                            new Date().toISOString(),
 
-                    finalItems.push(
-                        card
-                    );
+                        _saved: false
+                    });
 
-                    newCount++;
+                    added++;
                 }
 
                 reqLog.info(
-                    `📦 الجولة ${round}: تم اكتشاف ${finalItems.length} إعلان فريد`
+                    `📦 الجولة ${round}: ` +
+                    `${candidates.length} إعلان`
                 );
-
-                // --------------------------------------------
-                // إذا الوضع العادي
-                // لا نحتاج الاستمرار
-                // --------------------------------------------
 
                 if (
                     !todayOnly &&
-                    finalItems.length >=
-                        Number(maxResults)
+                    candidates.length >=
+                    Number(maxResults)
                 ) {
                     break;
                 }
 
-                // --------------------------------------------
-                // إذا لم نجد جديداً
-                // --------------------------------------------
-
                 if (
-                    finalItems.length ===
+                    candidates.length ===
                     previousCount
                 ) {
                     staleRounds++;
@@ -582,65 +393,60 @@ const crawler = new PlaywrightCrawler({
                 }
 
                 previousCount =
-                    finalItems.length;
+                    candidates.length;
 
-                // إذا لم يعد الموقع يعطينا شيئاً جديداً
-                if (
-                    staleRounds >= 3
-                ) {
+                if (staleRounds >= 3) {
                     reqLog.info(
-                        '🛑 لم تظهر إعلانات جديدة بعد عدة محاولات.'
+                        '🛑 لا توجد نتائج جديدة.'
                     );
-
                     break;
                 }
 
-                // --------------------------------------------
-                // Scroll
-                // --------------------------------------------
-
-                await page.evaluate(() => {
-                    window.scrollBy(
-                        0,
-                        window.innerHeight * 4
-                    );
-                });
+                await page.evaluate(
+                    () => {
+                        window.scrollBy(
+                            0,
+                            window.innerHeight * 4
+                        );
+                    }
+                );
 
                 await page.waitForTimeout(
-                    todayOnly ? 1800 : 2000
+                    todayOnly
+                        ? 1500
+                        : 1200
                 );
             }
 
             reqLog.info(
-                `🔎 إجمالي الإعلانات المرشحة للتفاصيل: ${finalItems.length}`
+                `🔎 المرشحون: ${candidates.length}`
             );
 
             // =================================================
-            // إضافة صفحات التفاصيل
+            // صفحات التفاصيل
             // =================================================
 
             for (
-                const item of finalItems
+                const item of candidates
             ) {
 
                 if (
-                    detailQueuedIds.has(
+                    queuedIds.has(
                         item._raw_id
                     )
                 ) {
                     continue;
                 }
 
-                // الوضع العادي:
                 if (
                     !todayOnly &&
-                    detailQueuedIds.size >=
-                        Number(maxResults)
+                    queuedIds.size >=
+                    Number(maxResults)
                 ) {
                     break;
                 }
 
-                detailQueuedIds.add(
+                queuedIds.add(
                     item._raw_id
                 );
 
@@ -649,11 +455,13 @@ const crawler = new PlaywrightCrawler({
                         url: item.url,
 
                         userData: {
-                            label: 'DETAIL',
+                            label:
+                                'DETAIL',
+
                             rawId:
-                                item._raw_id,
-                        },
-                    },
+                                item._raw_id
+                        }
+                    }
                 ]);
             }
 
@@ -665,134 +473,250 @@ const crawler = new PlaywrightCrawler({
         // ====================================================
 
         if (
-            request.userData.label ===
+            request.userData.label !==
             'DETAIL'
         ) {
+            return;
+        }
 
-            const rawId =
-                request.userData.rawId;
+        const rawId =
+            request.userData.rawId;
 
-            reqLog.info(
-                `📄 جلب تفاصيل العقار ${rawId}`
-            );
+        reqLog.info(
+            `📄 تفاصيل: ${rawId}`
+        );
 
-            // ------------------------------------------------
-            // حظر الصور والفيديو والخطوط
-            // ------------------------------------------------
+        // ----------------------------------------------------
+        // منع الصور
+        // ----------------------------------------------------
 
-            await page.route(
-                '**/*',
-                async (route) => {
+        await page.route(
+            '**/*',
+            async route => {
 
-                    const type =
-                        route.request()
-                            .resourceType();
+                const type =
+                    route.request()
+                        .resourceType();
 
-                    if (
-                        [
-                            'image',
-                            'media',
-                            'font',
-                        ].includes(type)
-                    ) {
-                        await route.abort();
-                    } else {
-                        await route.continue();
+                if (
+                    [
+                        'image',
+                        'media',
+                        'font'
+                    ].includes(type)
+                ) {
+                    await route.abort();
+                } else {
+                    await route.continue();
+                }
+            }
+        );
+
+        await page.goto(
+            request.url,
+            {
+                waitUntil:
+                    'domcontentloaded',
+                timeout: 60000
+            }
+        );
+
+        await page.waitForTimeout(1200);
+
+        // ====================================================
+        // الصفحة كاملة
+        // ====================================================
+
+        const bodyText =
+            await page.locator('body')
+                .innerText()
+                .catch(() => '');
+
+        let phone =
+            extractPhone(bodyText);
+
+        // ====================================================
+        // TEL
+        // ====================================================
+
+        if (!phone) {
+
+            phone =
+                await page.evaluate(
+                    () => {
+
+                        const links =
+                            Array.from(
+                                document.querySelectorAll(
+                                    'a[href^="tel:"],a[href*="tel:"]'
+                                )
+                            );
+
+                        for (
+                            const link of links
+                        ) {
+
+                            const href =
+                                link.href ||
+                                link.getAttribute(
+                                    'href'
+                                ) ||
+                                '';
+
+                            if (href) {
+                                return href;
+                            }
+                        }
+
+                        return '';
                     }
-                }
-            );
+                );
 
-            // ------------------------------------------------
-            // فتح التفاصيل
-            // ------------------------------------------------
+            phone =
+                extractPhone(phone);
+        }
 
-            await page.goto(
-                request.url,
-                {
-                    waitUntil:
-                        'domcontentloaded',
-                    timeout: 60000,
-                }
-            );
+        // ====================================================
+        // محاولة كشف الهاتف عبر زر الاتصال
+        // ====================================================
+
+        if (
+            !phone &&
+            fetchPhoneFromDetail
+        ) {
 
             try {
 
-                await page.waitForSelector(
-                    '[class*="description"],' +
-                    '[class*="body"],' +
-                    '[class*="desc"]',
-                    {
-                        timeout: 8000,
-                    }
-                );
+                const buttons =
+                    page.locator(
+                        'button, a'
+                    );
 
-            } catch {
-                // نكمل
-            }
+                const count =
+                    await buttons.count();
 
-            await page.waitForTimeout(
-                1000
-            );
+                for (
+                    let i = 0;
+                    i < count;
+                    i++
+                ) {
 
-            // ------------------------------------------------
-            // قراءة النص
-            // ------------------------------------------------
+                    const button =
+                        buttons.nth(i);
 
-            const descriptionText =
-                await page.evaluate(() => {
+                    const text =
+                        cleanText(
+                            await button
+                                .innerText()
+                                .catch(
+                                    () => ''
+                                )
+                        );
 
-                    const selectors = [
-                        '[class*="description"]',
-                        '[class*="body"]',
-                        '[class*="desc"]',
-                        '[class*="property-info"]',
-                        '[class*="detail"]',
-                    ];
+                    const aria =
+                        cleanText(
+                            await button
+                                .getAttribute(
+                                    'aria-label'
+                                )
+                                .catch(
+                                    () => ''
+                                )
+                        );
 
-                    for (
-                        const selector of selectors
+                    const label =
+                        `${text} ${aria}`;
+
+                    if (
+                        !/اتصال|اتصل|جوال|هاتف|call|phone/i
+                            .test(label)
                     ) {
+                        continue;
+                    }
 
-                        const el =
-                            document.querySelector(
-                                selector
+                    await button
+                        .click({
+                            timeout: 3000
+                        })
+                        .catch(
+                            () => {}
+                        );
+
+                    await page.waitForTimeout(
+                        700
+                    );
+
+                    const tel =
+                        await page.evaluate(
+                            () => {
+
+                                const links =
+                                    Array.from(
+                                        document.querySelectorAll(
+                                            'a[href^="tel:"],a[href*="tel:"]'
+                                        )
+                                    );
+
+                                return links.length
+                                    ? (
+                                        links[
+                                            links.length - 1
+                                        ].href || ''
+                                    )
+                                    : '';
+                            }
+                        );
+
+                    phone =
+                        extractPhone(tel);
+
+                    if (phone) {
+                        break;
+                    }
+
+                    const afterText =
+                        await page
+                            .locator('body')
+                            .innerText()
+                            .catch(
+                                () => ''
                             );
 
-                        if (
-                            el &&
-                            el.textContent &&
-                            el.textContent
-                                .trim()
-                                .length > 50
-                        ) {
-                            return el
-                                .textContent
-                                .trim();
-                        }
+                    phone =
+                        extractPhone(
+                            afterText
+                        );
+
+                    if (phone) {
+                        break;
                     }
+                }
 
-                    return (
-                        document.body
-                            ?.innerText ||
-                        ''
-                    );
-                });
+            } catch (error) {
 
-            // ------------------------------------------------
-            // الهاتف من النص
-            // ------------------------------------------------
-
-            let phone =
-                extractPhone(
-                    descriptionText
+                reqLog.warning(
+                    `⚠️ تعذر كشف الهاتف بالزر: ${error.message}`
                 );
+            }
+        }
 
-            // ------------------------------------------------
-            // __NEXT_DATA__
-            // ------------------------------------------------
+        // ====================================================
+        // NEXT DATA
+        // ====================================================
 
-            const nextDataText =
-                await page.evaluate(() => {
+        let postedAt = '';
+        let updatedAt = '';
+        let ownerName = '';
+        let districtValue = '';
+        let area = '';
+        let bedrooms = '';
+        let bathrooms = '';
+        let rega = '';
+        let verified = false;
+
+        const nextData =
+            await page.evaluate(
+                () => {
 
                     const el =
                         document.querySelector(
@@ -801,730 +725,983 @@ const crawler = new PlaywrightCrawler({
 
                     return el
                         ? el.textContent
-                        : null;
-                });
+                        : '';
+                }
+            );
 
-            // ------------------------------------------------
-            // المتغيرات
-            // ------------------------------------------------
+        if (nextData) {
 
-            let posted_at =
-                '';
+            try {
 
-            let posted_at_iso =
-                '';
+                const data =
+                    JSON.parse(nextData);
 
-            let updated_at =
-                '';
+                const objects = [];
 
-            let bedrooms =
-                '';
+                function walk(
+                    value,
+                    depth = 0
+                ) {
 
-            let bathrooms =
-                '';
-
-            let area_sqm =
-                '';
-
-            let district =
-                '';
-
-            let owner_name =
-                '';
-
-            let is_verified =
-                false;
-
-            let rega_license =
-                '';
-
-            // =================================================
-            // تحليل NEXT_DATA
-            // =================================================
-
-            if (nextDataText) {
-
-                try {
-
-                    const data =
-                        JSON.parse(
-                            nextDataText
-                        );
-
-                    let propObj =
-                        null;
-
-                    // ----------------------------------------
-                    // البحث عن property_info
-                    // ----------------------------------------
-
-                    const findProp =
-                        (
-                            obj,
-                            depth = 0
-                        ) => {
-
-                            if (
-                                depth > 15 ||
-                                propObj ||
-                                !obj ||
-                                typeof obj !==
-                                    'object'
-                            ) {
-                                return;
-                            }
-
-                            if (
-                                obj.property_info &&
-                                obj.id
-                            ) {
-
-                                propObj =
-                                    obj;
-
-                                return;
-                            }
-
-                            for (
-                                const val of
-                                    Object.values(
-                                        obj
-                                    )
-                            ) {
-
-                                findProp(
-                                    val,
-                                    depth + 1
-                                );
-                            }
-                        };
-
-                    findProp(data);
-
-                    // ----------------------------------------
-                    // Fallback: بعض نسخ Wasalt
-                    // ----------------------------------------
-
-                    if (!propObj) {
-
-                        const findAlternative =
-                            (
-                                obj,
-                                depth = 0
-                            ) => {
-
-                                if (
-                                    depth > 15 ||
-                                    propObj ||
-                                    !obj ||
-                                    typeof obj !==
-                                        'object'
-                                ) {
-                                    return;
-                                }
-
-                                if (
-                                    (
-                                        obj.title ||
-                                        obj.name
-                                    ) &&
-                                    (
-                                        obj.price ||
-                                        obj.createdAt ||
-                                        obj.created_at ||
-                                        obj.published_at
-                                    )
-                                ) {
-
-                                    propObj =
-                                        obj;
-
-                                    return;
-                                }
-
-                                for (
-                                    const val of
-                                        Object.values(
-                                            obj
-                                        )
-                                ) {
-
-                                    findAlternative(
-                                        val,
-                                        depth + 1
-                                    );
-                                }
-                            };
-
-                        findAlternative(
-                            data
-                        );
+                    if (
+                        depth > 12 ||
+                        value === null ||
+                        typeof value !==
+                        'object'
+                    ) {
+                        return;
                     }
 
-                    // =================================================
-                    // معالجة العقار
-                    // =================================================
+                    if (
+                        value &&
+                        typeof value ===
+                        'object'
+                    ) {
+                        objects.push(value);
+                    }
 
-                    if (propObj) {
+                    for (
+                        const child of
+                        Object.values(value)
+                    ) {
+                        walk(
+                            child,
+                            depth + 1
+                        );
+                    }
+                }
 
-                        const info =
-                            propObj.property_info ||
-                            propObj.propertyInfo ||
-                            {};
+                walk(data);
 
-                        const owner =
-                            propObj.property_owner ||
-                            propObj.owner ||
-                            {};
+                // --------------------------------------------
+                // العثور على الكائن الأكثر احتمالاً
+                // --------------------------------------------
 
-                        const rega =
-                            propObj.rega_raw_info ||
-                            propObj.rega ||
-                            {};
+                const prop =
+                    objects.find(
+                        x =>
+                            x.property_info &&
+                            (
+                                x.id ||
+                                x.property_id
+                            )
+                    ) ||
+                    objects.find(
+                        x =>
+                            (
+                                x.title ||
+                                x.name
+                            ) &&
+                            (
+                                x.created_at ||
+                                x.createdAt ||
+                                x.published_at
+                            )
+                    );
 
-                        // --------------------------------------------
-                        // الهاتف
-                        // --------------------------------------------
+                if (prop) {
 
-                        const nextPhone =
-                            rega.phone_number ||
-                            rega.responsible_employee_phone_number ||
-                            owner.mobile ||
-                            owner.phone ||
-                            propObj.phone ||
-                            propObj.mobile ||
-                            propObj.contact_phone ||
-                            '';
+                    const info =
+                        prop.property_info ||
+                        prop.propertyInfo ||
+                        {};
+
+                    const owner =
+                        prop.property_owner ||
+                        prop.owner ||
+                        {};
+
+                    const regaInfo =
+                        prop.rega_raw_info ||
+                        prop.rega ||
+                        {};
+
+                    // ----------------------------------------
+                    // الهاتف
+                    // ----------------------------------------
+
+                    const phoneValues = [
+                        regaInfo.phone_number,
+                        regaInfo.responsible_employee_phone_number,
+                        owner.mobile,
+                        owner.phone,
+                        owner.mobile_number,
+                        prop.phone,
+                        prop.mobile,
+                        prop.mobile_number,
+                        prop.contact_phone
+                    ];
+
+                    for (
+                        const value of
+                        phoneValues
+                    ) {
+
+                        if (!phone && value) {
+                            phone =
+                                extractPhone(
+                                    value
+                                );
+                        }
+
+                        if (phone) break;
+                    }
+
+                    // ----------------------------------------
+                    // المعلن
+                    // ----------------------------------------
+
+                    ownerName =
+                        owner.ar_name ||
+                        owner.name ||
+                        owner.full_name ||
+                        prop.advertiser_name ||
+                        prop.owner_name ||
+                        '';
+
+                    // ----------------------------------------
+                    // الحي
+                    // ----------------------------------------
+
+                    districtValue =
+                        info.zone ||
+                        info.district ||
+                        info.neighborhood ||
+                        prop.district ||
+                        '';
+
+                    // ----------------------------------------
+                    // المساحة
+                    // ----------------------------------------
+
+                    area =
+                        prop.floor_size ||
+                        regaInfo.property_area ||
+                        info.area ||
+                        '';
+
+                    // ----------------------------------------
+                    // التحقق
+                    // ----------------------------------------
+
+                    verified =
+                        !!(
+                            prop.is_verified ||
+                            prop.is_rega_prop ||
+                            prop.verified
+                        );
+
+                    // ----------------------------------------
+                    // رخصة فال
+                    // ----------------------------------------
+
+                    rega =
+                        regaInfo.ad_license_number ||
+                        regaInfo.fal_license ||
+                        owner.rega_adv_lic_no ||
+                        prop.fal_license ||
+                        prop.rega_license ||
+                        '';
+
+                    // ----------------------------------------
+                    // التاريخ
+                    // ----------------------------------------
+
+                    const posted =
+                        prop.published_at ||
+                        prop.created_at ||
+                        prop.createdAt ||
+                        info.published_at ||
+                        info.created_at ||
+                        regaInfo.creation_date ||
+                        regaInfo.issue_date ||
+                        '';
+
+                    const updated =
+                        prop.updated_at ||
+                        prop.updatedAt ||
+                        info.updated_at ||
+                        info.updatedAt ||
+                        '';
+
+                    if (posted) {
+                        postedAt = posted;
+                    }
+
+                    if (updated) {
+                        updatedAt = updated;
+                    }
+
+                    // ----------------------------------------
+                    // الخصائص
+                    // ----------------------------------------
+
+                    for (
+                        const attr of
+                        prop.attributes || []
+                    ) {
 
                         if (
-                            nextPhone &&
-                            !phone
+                            attr.key ===
+                            'noOfBedrooms'
                         ) {
-                            phone =
-                                extractPhone(
-                                    String(
-                                        nextPhone
-                                    )
-                                ) ||
-                                String(
-                                    nextPhone
-                                );
+                            bedrooms =
+                                attr.value;
                         }
 
-                        // --------------------------------------------
-                        // الهاتف من وصف الإعلان
-                        // --------------------------------------------
-
-                        if (!phone) {
-
-                            const bodyText =
-                                propObj.rega_moj_desc ||
-                                info.description ||
-                                propObj.description ||
-                                '';
-
-                            phone =
-                                extractPhone(
-                                    bodyText
-                                );
+                        if (
+                            attr.key ===
+                            'noOfBathrooms'
+                        ) {
+                            bathrooms =
+                                attr.value;
                         }
 
-                        // --------------------------------------------
-                        // المعلن
-                        // --------------------------------------------
+                        if (
+                            attr.key ===
+                            'builtUpArea' &&
+                            !area
+                        ) {
+                            area =
+                                attr.value;
+                        }
+                    }
+                }
 
-                        owner_name =
-                            owner.ar_name ||
-                            owner.name ||
-                            owner.full_name ||
-                            propObj.advertiser_name ||
-                            propObj.owner_name ||
-                            '';
+            } catch (error) {
 
-                        // --------------------------------------------
-                        // التحقق
-                        // --------------------------------------------
+                reqLog.warning(
+                    `⚠️ NEXT_DATA: ${error.message}`
+                );
+            }
+        }
 
-                        is_verified =
-                            !!(
-                                propObj.is_verified ||
-                                propObj.is_rega_prop ||
-                                propObj.verified
-                            );
+        // ====================================================
+        // التاريخ من DOM
+        // ====================================================
 
-                        // --------------------------------------------
-                        // المساحة
-                        // --------------------------------------------
+        if (!postedAt) {
 
-                        area_sqm =
-                            String(
-                                propObj.floor_size ||
-                                rega.property_area ||
-                                info.area ||
-                                ''
-                            );
+            postedAt =
+                await page.evaluate(
+                    () => {
 
-                        // --------------------------------------------
-                        // المنطقة
-                        // --------------------------------------------
-
-                        district =
-                            info.zone ||
-                            info.district ||
-                            info.neighborhood ||
-                            propObj.district ||
-                            '';
-
-                        // --------------------------------------------
-                        // رخصة فال
-                        // --------------------------------------------
-
-                        rega_license =
-                            rega.ad_license_number ||
-                            rega.fal_license ||
-                            owner.rega_adv_lic_no ||
-                            propObj.fal_license ||
-                            propObj.rega_license ||
-                            '';
-
-                        // --------------------------------------------
-                        // الخصائص
-                        // --------------------------------------------
-
-                        const attrs =
-                            propObj.attributes ||
-                            [];
+                        const selectors = [
+                            'time[datetime]',
+                            '[class*="publish"]',
+                            '[class*="posted"]',
+                            '[class*="date"]'
+                        ];
 
                         for (
-                            const attr of attrs
+                            const selector of
+                            selectors
                         ) {
-
-                            if (
-                                attr.key ===
-                                'noOfBedrooms'
-                            ) {
-                                bedrooms =
-                                    String(
-                                        attr.value ||
-                                        ''
-                                    );
-                            }
-
-                            if (
-                                attr.key ===
-                                'noOfBathrooms'
-                            ) {
-                                bathrooms =
-                                    String(
-                                        attr.value ||
-                                        ''
-                                    );
-                            }
-
-                            if (
-                                attr.key ===
-                                    'builtUpArea' &&
-                                !area_sqm
-                            ) {
-                                area_sqm =
-                                    String(
-                                        attr.value ||
-                                        ''
-                                    );
-                            }
-                        }
-
-                        // --------------------------------------------
-                        // تاريخ النشر
-                        // --------------------------------------------
-
-                        const rawPosted =
-                            propObj.published_at ||
-                            propObj.created_at ||
-                            propObj.createdAt ||
-                            info.published_at ||
-                            info.created_at ||
-                            rega.creation_date ||
-                            rega.issue_date ||
-                            '';
-
-                        if (
-                            rawPosted
-                        ) {
-
-                            const d =
-                                parseDate(
-                                    rawPosted
-                                );
-
-                            if (d) {
-
-                                posted_at_iso =
-                                    d.toISOString();
-
-                                posted_at =
-                                    formatRiyadhDate(
-                                        d
-                                    );
-                            }
-                        }
-
-                        // --------------------------------------------
-                        // تاريخ التحديث
-                        // --------------------------------------------
-
-                        const rawUpdated =
-                            propObj.updated_at ||
-                            propObj.updatedAt ||
-                            info.updated_at ||
-                            info.updatedAt ||
-                            '';
-
-                        if (
-                            rawUpdated
-                        ) {
-
-                            const d =
-                                parseDate(
-                                    rawUpdated
-                                );
-
-                            if (d) {
-
-                                updated_at =
-                                    formatRiyadhDate(
-                                        d
-                                    );
-                            }
-                        }
-                    }
-
-                } catch (error) {
-
-                    reqLog.warning(
-                        `⚠️ فشل تحليل __NEXT_DATA__: ${error.message}`
-                    );
-                }
-            }
-
-            // =================================================
-            // FALLBACK: tel:
-            // =================================================
-
-            if (!phone) {
-
-                const telHref =
-                    await page.evaluate(
-                        () => {
 
                             const el =
                                 document.querySelector(
-                                    'a[href^="tel:"]'
+                                    selector
                                 );
 
-                            return el
-                                ? el.href
-                                : '';
-                        }
-                    );
+                            if (!el) continue;
 
-                if (telHref) {
-
-                    phone =
-                        extractPhone(
-                            telHref
-                                .replace(
-                                    /^tel:/i,
-                                    ''
-                                )
-                        );
-                }
-            }
-
-            // =================================================
-            // FALLBACK: التاريخ من DOM
-            // =================================================
-
-            if (!posted_at) {
-
-                const domDate =
-                    await page.evaluate(
-                        () => {
-
-                            const selectors = [
-                                'time[datetime]',
-                                '[class*="publish"]',
-                                '[class*="date"]',
-                            ];
-
-                            for (
-                                const selector of
-                                    selectors
-                            ) {
-
-                                const el =
-                                    document.querySelector(
-                                        selector
-                                    );
-
-                                if (!el) {
-                                    continue;
-                                }
-
-                                return (
-                                    el.getAttribute(
-                                        'datetime'
-                                    ) ||
-                                    el.innerText
-                                        ?.trim() ||
-                                    ''
-                                );
-                            }
-
-                            return '';
-                        }
-                    );
-
-                if (domDate) {
-
-                    const d =
-                        parseDate(
-                            domDate
-                        );
-
-                    if (d) {
-
-                        posted_at_iso =
-                            d.toISOString();
-
-                        posted_at =
-                            formatRiyadhDate(
-                                d
+                            return (
+                                el.getAttribute(
+                                    'datetime'
+                                ) ||
+                                el.innerText ||
+                                ''
                             );
+                        }
+
+                        return '';
                     }
-                }
-            }
-
-            // =================================================
-            // إيجاد الإعلان في القائمة
-            // =================================================
-
-            const idx =
-                finalItems.findIndex(
-                    (item) =>
-                        item._raw_id ===
-                        rawId
                 );
+        }
 
-            if (idx === -1) {
-                return;
-            }
+        // ====================================================
+        // تحديث العنصر
+        // ====================================================
 
-            // =================================================
-            // تحديث البيانات
-            // =================================================
+        const index =
+            candidates.findIndex(
+                item =>
+                    item._raw_id ===
+                    rawId
+            );
 
-            finalItems[idx].phone =
-                phone || '';
+        if (index === -1) {
+            return;
+        }
 
-            finalItems[idx].posted_at =
-                posted_at || '';
+        const item =
+            candidates[index];
 
-            finalItems[idx].posted_at_iso =
-                posted_at_iso || '';
+        item.phone =
+            phone || '';
 
-            finalItems[idx].updated_at =
-                updated_at || '';
+        item.owner_name =
+            cleanText(ownerName);
 
-            finalItems[idx].bedrooms =
-                bedrooms ||
-                finalItems[idx].bedrooms;
+        item.district =
+            cleanText(
+                districtValue ||
+                item.district ||
+                district
+            );
 
-            finalItems[idx].bathrooms =
-                bathrooms ||
-                finalItems[idx].bathrooms;
+        item.area_sqm =
+            String(area || '');
 
-            finalItems[idx].area_sqm =
-                area_sqm ||
-                finalItems[idx].area_sqm;
+        item.bedrooms =
+            String(bedrooms || '');
 
-            finalItems[idx].district =
-                district ||
-                finalItems[idx].district;
+        item.bathrooms =
+            String(bathrooms || '');
 
-            finalItems[idx].owner_name =
-                owner_name;
+        item.rega_license =
+            String(rega || '');
 
-            finalItems[idx].is_verified =
-                is_verified;
+        item.is_verified =
+            verified;
 
-            finalItems[idx].rega_license =
-                rega_license;
+        const postedDate =
+            parseDate(postedAt);
 
-            // =================================================
-            // TODAY ONLY
-            // =================================================
+        if (postedDate) {
 
-            if (todayOnly) {
+            item.posted_at_iso =
+                postedDate.toISOString();
 
-                // --------------------------------------------
-                // لا يوجد تاريخ موثوق
-                // --------------------------------------------
-
-                if (!posted_at_iso) {
-
-                    reqLog.info(
-                        `⏭️ ${rawId} — لا يوجد تاريخ نشر موثوق، تم تجاهله`
-                    );
-
-                    return;
-                }
-
-                // --------------------------------------------
-                // الإعلان ليس من اليوم
-                // --------------------------------------------
-
-                if (
-                    !isTodayRiyadh(
-                        posted_at_iso
-                    )
-                ) {
-
-                    reqLog.info(
-                        `⏭️ ${rawId} — قديم | ${posted_at}`
-                    );
-
-                    return;
-                }
-
-                // --------------------------------------------
-                // الإعلان من اليوم
-                // --------------------------------------------
-
-                reqLog.info(
-                    `🟢 [إعلان اليوم] ${rawId} | ${posted_at}`
+            item.posted_at =
+                formatDate(
+                    postedDate
                 );
-            }
+        }
 
-            // =================================================
-            // MAX RESULTS
-            // =================================================
+        const updatedDate =
+            parseDate(updatedAt);
+
+        if (updatedDate) {
+
+            item.updated_at =
+                formatDate(
+                    updatedDate
+                );
+        }
+
+        // ====================================================
+        // TODAY ONLY
+        // ====================================================
+
+        if (todayOnly) {
 
             if (
-                savedCount >=
-                Number(maxResults)
+                !item.posted_at_iso
             ) {
 
                 reqLog.info(
-                    `⏭️ تم الوصول إلى maxResults=${maxResults}`
+                    `⏭️ ${rawId} — بدون تاريخ موثوق`
                 );
 
                 return;
             }
 
-            // =================================================
-            // حفظ الإعلان
-            // =================================================
+            if (
+                !isToday(
+                    item.posted_at_iso
+                )
+            ) {
 
-            finalItems[idx]._saved =
-                true;
+                reqLog.info(
+                    `⏭️ ${rawId} — قديم | ${item.posted_at}`
+                );
 
-            await Actor.pushData(
-                finalItems[idx]
-            );
-
-            savedCount++;
+                return;
+            }
 
             reqLog.info(
-                `✅ تم حفظ الإعلان ${rawId} | ` +
-                `${finalItems[idx].priceSar || ''} ريال | ` +
-                `${phone || 'لا جوال'} | ` +
-                `${posted_at || 'لا تاريخ'} | ` +
-                `اليوم فقط=${todayOnly}`
+                `🟢 إعلان اليوم: ${rawId}`
             );
         }
+
+        // ====================================================
+        // MAX RESULTS
+        // ====================================================
+
+        if (
+            savedCount >=
+            Number(maxResults)
+        ) {
+            return;
+        }
+
+        // ====================================================
+        // SAVE
+        // ====================================================
+
+        item._saved = true;
+
+        await Actor.pushData(
+            item
+        );
+
+        savedCount++;
+
+        reqLog.info(
+            `✅ حفظ ${rawId} | ` +
+            `📞 ${item.phone || 'لا يوجد'} | ` +
+            `📅 ${item.posted_at || 'لا يوجد'}`
+        );
     },
 
     // ========================================================
-    // FAILED REQUEST
+    // FAILED
     // ========================================================
 
     async failedRequestHandler({
         request,
-        error,
+        error
     }) {
 
-        const rawId =
-            request.userData?.rawId;
-
-        // لا نحفظ إعلاناً فاشلاً عندما todayOnly=true
-        // لأننا لا نستطيع التأكد من تاريخ نشره.
-
-        if (
-            request.userData?.label ===
-                'DETAIL' &&
-            !todayOnly
-        ) {
-
-            const idx =
-                finalItems.findIndex(
-                    (item) =>
-                        item._raw_id ===
-                        rawId
-                );
-
-            if (
-                idx !== -1 &&
-                !finalItems[idx]._saved
-            ) {
-
-                finalItems[idx]._saved =
-                    true;
-
-                await Actor.pushData(
-                    finalItems[idx]
-                );
-            }
-        }
-
         log.error(
-            `❌ فشل: ${request.url} — ${error.message}`
+            `❌ فشل الطلب: ${request.url} | ${error.message}`
         );
-    },
+    }
 });
 
 // ============================================================
-// START
+// SEARCH PAGE HELPERS
 // ============================================================
 
-const searchUrl =
-    `https://wasalt.sa/ar/${listingType}/search` +
-    `?cityId=${cityId}` +
-    `&countryId=1` +
-    `&propertyFor=${listingType}` +
-    `&type=${propertyType}`;
+async function selectSearchLocation(
+    page,
+    city,
+    district,
+    reqLog
+) {
 
-log.info(
-    `🚀 بدء البحث`
-);
+    // --------------------------------------------------------
+    // المدينة
+    // --------------------------------------------------------
 
-log.info(
-    `📍 المدينة: ${city}`
-);
+    if (city) {
 
-log.info(
-    `📅 todayOnly: ${todayOnly}`
-);
+        const cityInput =
+            page.locator(
+                'input'
+            ).filter({
+                has: undefined
+            });
 
-if (todayOnly) {
+        const inputs =
+            page.locator(
+                'input'
+            );
 
-    log.info(
-        `📅 تاريخ الرياض المستهدف: ${getRiyadhDateString()}`
+        const count =
+            await inputs.count();
+
+        for (
+            let i = 0;
+            i < count;
+            i++
+        ) {
+
+            const el =
+                inputs.nth(i);
+
+            const placeholder =
+                cleanText(
+                    await el
+                        .getAttribute(
+                            'placeholder'
+                        )
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            const aria =
+                cleanText(
+                    await el
+                        .getAttribute(
+                            'aria-label'
+                        )
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            const name =
+                cleanText(
+                    await el
+                        .getAttribute(
+                            'name'
+                        )
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            const label =
+                `${placeholder} ${aria} ${name}`;
+
+            if (
+                /مدينة|city/i.test(label)
+            ) {
+
+                await el
+                    .fill(city)
+                    .catch(
+                        () => {}
+                    );
+
+                await page.waitForTimeout(
+                    800
+                );
+
+                await chooseSuggestion(
+                    page,
+                    city
+                );
+
+                reqLog.info(
+                    `📍 المدينة: ${city}`
+                );
+
+                break;
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    // الحي
+    // --------------------------------------------------------
+
+    if (district) {
+
+        const inputs =
+            page.locator(
+                'input'
+            );
+
+        const count =
+            await inputs.count();
+
+        for (
+            let i = 0;
+            i < count;
+            i++
+        ) {
+
+            const el =
+                inputs.nth(i);
+
+            const placeholder =
+                cleanText(
+                    await el
+                        .getAttribute(
+                            'placeholder'
+                        )
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            const aria =
+                cleanText(
+                    await el
+                        .getAttribute(
+                            'aria-label'
+                        )
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            const name =
+                cleanText(
+                    await el
+                        .getAttribute(
+                            'name'
+                        )
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            const label =
+                `${placeholder} ${aria} ${name}`;
+
+            if (
+                /حي|district|neighborhood/i
+                    .test(label)
+            ) {
+
+                await el
+                    .fill(district)
+                    .catch(
+                        () => {}
+                    );
+
+                await page.waitForTimeout(
+                    800
+                );
+
+                await chooseSuggestion(
+                    page,
+                    district
+                );
+
+                reqLog.info(
+                    `🏘️ الحي: ${district}`
+                );
+
+                break;
+            }
+        }
+    }
+}
+
+// ============================================================
+// اختيار الاقتراح
+// ============================================================
+
+async function chooseSuggestion(
+    page,
+    value
+) {
+
+    const text =
+        cleanText(value);
+
+    const selectors = [
+        `[role="option"]`,
+        'li',
+        '[class*="suggest"]',
+        '[class*="autocomplete"]',
+        '[class*="option"]'
+    ];
+
+    for (
+        const selector of selectors
+    ) {
+
+        const locator =
+            page.locator(
+                selector
+            );
+
+        const count =
+            await locator.count();
+
+        for (
+            let i = 0;
+            i < Math.min(count, 15);
+            i++
+        ) {
+
+            const item =
+                locator.nth(i);
+
+            const itemText =
+                cleanText(
+                    await item
+                        .innerText()
+                        .catch(
+                            () => ''
+                        )
+                );
+
+            if (
+                itemText &&
+                (
+                    itemText === text ||
+                    itemText.includes(text)
+                )
+            ) {
+
+                await item
+                    .click()
+                    .catch(
+                        () => {}
+                    );
+
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================
+// نوع العقار
+// ============================================================
+
+async function selectPropertyType(
+    page,
+    type,
+    reqLog
+) {
+
+    if (!type) return;
+
+    const wanted =
+        /residential/i.test(type)
+            ? 'سكني'
+            : type;
+
+    const elements =
+        page.locator(
+            'button, [role="button"], select'
+        );
+
+    const count =
+        await elements.count();
+
+    for (
+        let i = 0;
+        i < count;
+        i++
+    ) {
+
+        const el =
+            elements.nth(i);
+
+        const text =
+            cleanText(
+                await el
+                    .innerText()
+                    .catch(
+                        () => ''
+                    )
+            );
+
+        if (
+            /نوع العقار|property type/i
+                .test(text)
+        ) {
+
+            await el
+                .click()
+                .catch(
+                    () => {}
+                );
+
+            await page.waitForTimeout(
+                400
+            );
+
+            await chooseSuggestion(
+                page,
+                wanted
+            );
+
+            return;
+        }
+    }
+}
+
+// ============================================================
+// زر البحث
+// ============================================================
+
+async function clickSearch(
+    page,
+    reqLog
+) {
+
+    const buttons =
+        page.locator(
+            'button, [role="button"]'
+        );
+
+    const count =
+        await buttons.count();
+
+    for (
+        let i = 0;
+        i < count;
+        i++
+    ) {
+
+        const button =
+            buttons.nth(i);
+
+        const text =
+            cleanText(
+                await button
+                    .innerText()
+                    .catch(
+                        () => ''
+                    )
+            );
+
+        if (
+            /^بحث$|^search$/i.test(text)
+        ) {
+
+            await button
+                .click()
+                .catch(
+                    () => {}
+                );
+
+            reqLog.info(
+                '🔎 تم الضغط على بحث'
+            );
+
+            return;
+        }
+    }
+
+    // fallback
+    await page.keyboard
+        .press('Enter')
+        .catch(
+            () => {}
+        );
+}
+
+// ============================================================
+// استخراج بطاقات العقار
+// ============================================================
+
+async function extractCards(
+    page
+) {
+
+    return await page.evaluate(
+        () => {
+
+            const results = [];
+            const ids = new Set();
+
+            const links =
+                Array.from(
+                    document.querySelectorAll(
+                        'a[href*="/property/"]'
+                    )
+                );
+
+            for (
+                const link of links
+            ) {
+
+                const href =
+                    link.href || '';
+
+                if (!href) continue;
+
+                const url =
+                    href
+                        .split('?')[0]
+                        .split('#')[0];
+
+                const match =
+                    url.match(
+                        /-(\d+)$/
+                    );
+
+                if (!match) continue;
+
+                const id =
+                    match[1];
+
+                if (ids.has(id)) {
+                    continue;
+                }
+
+                ids.add(id);
+
+                const card =
+                    link.closest(
+                        'article, li'
+                    ) ||
+                    link.parentElement?.parentElement ||
+                    link.parentElement;
+
+                const text =
+                    card?.innerText || '';
+
+                const priceMatch =
+                    text.match(
+                        /([\d,]+)\s*(?:ريال|ر\.س)/
+                    );
+
+                const priceSar =
+                    priceMatch
+                        ? priceMatch[1]
+                            .replace(
+                                /,/g,
+                                ''
+                            )
+                        : '';
+
+                const title =
+                    link.getAttribute(
+                        'title'
+                    ) ||
+                    link.innerText
+                        ?.trim()
+                        .split('\n')[0] ||
+                    '';
+
+                const address =
+                    (
+                        card?.querySelector(
+                            '[class*="address"],' +
+                            '[class*="district"],' +
+                            '[class*="location"],' +
+                            '[class*="zone"]'
+                        )?.innerText ||
+                        ''
+                    ).trim();
+
+                let cardDistrict = '';
+
+                if (address) {
+
+                    const parts =
+                        address.split(
+                            '،'
+                        );
+
+                    if (
+                        parts.length >= 2
+                    ) {
+                        cardDistrict =
+                            parts[0].trim();
+                    }
+                }
+
+                results.push({
+                    id,
+
+                    url,
+
+                    title:
+                        title.trim(),
+
+                    priceSar,
+
+                    address:
+                        address.trim(),
+
+                    district:
+                        cardDistrict
+                });
+            }
+
+            return results;
+        }
     );
 }
 
 // ============================================================
-// RUN
+// START
 // ============================================================
 
 await crawler.run([
@@ -1532,9 +1709,9 @@ await crawler.run([
         url: searchUrl,
 
         userData: {
-            label: 'SEARCH',
-        },
-    },
+            label: 'SEARCH'
+        }
+    }
 ]);
 
 // ============================================================
@@ -1542,27 +1719,35 @@ await crawler.run([
 // ============================================================
 
 log.info(
-    `================================================`
+    '=========================================='
 );
 
 log.info(
-    `🎉 انتهى الأكتور`
+    '🎉 انتهى السحب'
 );
 
 log.info(
-    `📊 الإعلانات المكتشفة: ${finalItems.length}`
+    `📍 المدينة: ${city}`
 );
 
 log.info(
-    `✅ الإعلانات المحفوظة: ${savedCount}`
+    `🏘️ الحي: ${district || 'الكل'}`
 );
 
 log.info(
-    `📅 todayOnly: ${todayOnly}`
+    `📊 المرشحون: ${candidates.length}`
 );
 
 log.info(
-    `================================================`
+    `✅ المحفوظ: ${savedCount}`
+);
+
+log.info(
+    `📅 اليوم فقط: ${todayOnly}`
+);
+
+log.info(
+    '=========================================='
 );
 
 // ============================================================
@@ -1580,9 +1765,6 @@ if (
             process.env
                 .APIFY_DEFAULT_DATASET_ID;
 
-        const downloadUrl =
-            `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`;
-
         await fetch(
             webhookUrl,
             {
@@ -1590,7 +1772,7 @@ if (
 
                 headers: {
                     'Content-Type':
-                        'application/json',
+                        'application/json'
                 },
 
                 body: JSON.stringify({
@@ -1599,7 +1781,7 @@ if (
 
                     city,
 
-                    cityId,
+                    district,
 
                     listingType,
 
@@ -1612,28 +1794,23 @@ if (
 
                     datasetId,
 
-                    downloadUrl,
-
                     scannedAt:
-                        new Date().toISOString(),
-                }),
+                        new Date()
+                            .toISOString()
+                })
             }
         );
 
         log.info(
-            '✅ Webhook أُرسل بنجاح.'
+            '✅ تم إرسال Webhook'
         );
 
     } catch (error) {
 
         log.error(
-            `❌ فشل Webhook: ${error.message}`
+            `❌ Webhook: ${error.message}`
         );
     }
 }
-
-// ============================================================
-// EXIT
-// ============================================================
 
 await Actor.exit();
