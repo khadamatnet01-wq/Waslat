@@ -1,67 +1,93 @@
 {
     "title": "إعدادات سحب وصلت",
-    "description": "ضبط معاملات البحث وعدد النتائج واختيار نوع العقار والمدينة",
+    "description": "ضبط معاملات البحث في موقع وصلت (Wasalt)",
     "type": "object",
     "schemaVersion": 1,
     "properties": {
-        "search": {
-            "title": "كلمة البحث (اختياري)",
-            "type": "string",
-            "description": "كلمة أو عبارة للبحث بها داخل وصلت، مثل: شقة رياض",
-            "editor": "textfield"
-        },
         "city": {
-            "title": "اسم المدينة",
+            "title": "المدينة",
             "type": "string",
-            "description": "اسم المدينة بالعربي",
+            "description": "اسم المدينة التي تريد البحث فيها.",
             "default": "الرياض",
             "editor": "textfield"
         },
         "cityId": {
-            "title": "معرّف المدينة (cityId)",
+            "title": "معرّف المدينة",
             "type": "integer",
-            "description": "الرياض=273، جدة=274، الدمام=275، مكة=276، المدينة=277",
+            "description": "معرّف المدينة في وصلت. الرياض = 273.",
             "default": 273,
+            "minimum": 1,
             "editor": "number"
         },
         "listingType": {
-            "title": "نوع الإعلان",
+            "title": "نوع العملية",
             "type": "string",
-            "description": "بيع أو إيجار",
+            "description": "نوع الإعلان: sale للبيع أو rent للإيجار.",
             "default": "sale",
-            "enum": ["sale", "rent"],
-            "enumTitles": ["بيع", "إيجار"],
+            "enum": [
+                "sale",
+                "rent"
+            ],
+            "enumTitles": [
+                "للبيع",
+                "للإيجار"
+            ],
             "editor": "select"
         },
         "propertyType": {
             "title": "نوع العقار",
             "type": "string",
-            "description": "سكني أو تجاري",
+            "description": "نوع العقار المطلوب البحث عنه.",
             "default": "residential",
-            "enum": ["residential", "commercial"],
-            "enumTitles": ["سكني", "تجاري"],
+            "enum": [
+                "residential"
+            ],
+            "enumTitles": [
+                "سكني"
+            ],
             "editor": "select"
         },
         "maxResults": {
             "title": "أقصى عدد للنتائج",
             "type": "integer",
-            "description": "عدد العقارات المطلوب استخراجها",
+            "description": "عدد الإعلانات المطلوب استخراجها وحفظها.",
             "default": 20,
             "minimum": 1,
-            "maximum": 200,
+            "maximum": 500,
+            "editor": "number"
+        },
+        "todayOnly": {
+            "title": "إعلانات اليوم فقط",
+            "type": "boolean",
+            "description": "عند التفعيل، يتم حفظ الإعلانات التي تاريخ نشرها هو اليوم فقط حسب توقيت الرياض. يتم التحقق من تاريخ الإعلان من صفحة التفاصيل قبل حفظه.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "maxScrollRounds": {
+            "title": "عمق البحث",
+            "type": "integer",
+            "description": "عدد جولات التمرير في نتائج وصلت لاكتشاف إعلانات إضافية. عند تفعيل إعلانات اليوم فقط، يُفضّل رفع الرقم لأن الإعلانات القديمة قد تظهر قبل إعلانات اليوم.",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100,
             "editor": "number"
         },
         "proxyConfiguration": {
             "title": "إعدادات البروكسي",
             "type": "object",
-            "description": "يُنصح باستخدام Apify Residential Proxy لتجنب الحجب",
-            "prefill": { "useApifyProxy": true, "groups": ["RESIDENTIAL"] },
+            "description": "استخدام Apify Residential Proxy لتقليل احتمالية الحجب.",
+            "prefill": {
+                "useApifyProxy": true,
+                "groups": [
+                    "RESIDENTIAL"
+                ]
+            },
             "editor": "proxy"
         },
         "webhookUrl": {
             "title": "رابط Webhook (اختياري)",
             "type": "string",
-            "description": "رابط يُرسَل إليه إشعار JSON عند اكتمال السحب",
+            "description": "رابط يُرسل إليه إشعار JSON عند اكتمال السحب.",
             "editor": "textfield"
         }
     }
